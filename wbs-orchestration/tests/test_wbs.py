@@ -19,7 +19,8 @@ SECRET = "fictional-secret-value-123"
 
 # Stand-in for a real agent CLI: records what it received, then exits.
 FAKE_CLI = """
-import json, os, sys, time
+import json, os, re, subprocess, sys, time
+HEARTBEAT = "import sys, time\\nend = time.time() + 60\\nwhile time.time() < end:\\n    open(sys.argv[1], 'a').write('.')\\n    time.sleep(0.1)\\n"
 prompt = sys.stdin.read()
 with open(os.environ["FAKE_CLI_RECORD"], "a", encoding="utf-8") as f:
     f.write(json.dumps({"argv": sys.argv[1:], "prompt": prompt}) + "\\n")
@@ -33,6 +34,17 @@ if mode == "wait":
     deadline = time.time() + 60
     while not os.path.exists(os.environ["FAKE_CLI_RELEASE"]) and time.time() < deadline:
         time.sleep(0.05)
+if mode.startswith("report-"):
+    path = re.search(r"^Report file: (.+)$", prompt, re.M).group(1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("STATUS: " + mode[len("report-"):] + "\\nFictional report body\\n")
+if mode.startswith("spawn-"):
+    # A grandchild that keeps writing until it is ended, like a helper an agent CLI starts.
+    subprocess.Popen([sys.executable, "-c", HEARTBEAT, os.environ["FAKE_CLI_HEARTBEAT"]])
+    if mode == "spawn-hang":
+        time.sleep(60)
+    else:
+        time.sleep(1)
 sys.exit(1 if mode == "fail" else 0)
 """
 
@@ -52,6 +64,7 @@ class WbsTestCase(unittest.TestCase):
         self.release = self.dir / "release"
         self.fake_cli = self.dir / "fake_cli.py"
         self.fake_cli.write_text(FAKE_CLI, encoding="utf-8")
+        self.heartbeat = self.dir / "heartbeat"
 
     def cli(self, *argv):
         """Run a command in-process; returns (exit_code, parsed JSON stdout or None)."""
@@ -68,13 +81,15 @@ class WbsTestCase(unittest.TestCase):
     def ready_ids(self):
         return [t["id"] for t in self.cli("ready")[1]["ready"]]
 
-    def write_config(self, extra_args=(), argv=None, timeout=60):
+    def write_config(self, extra_args=(), argv=None, timeout=60, report_dir=None, **entry):
         config = {
             "warning_dir": str(self.warn_dir),
             "clis": {"cli-a": {"argv": argv or [sys.executable, str(self.fake_cli), *extra_args],
-                               "timeout_seconds": timeout}},
+                               "timeout_seconds": timeout, **entry}},
             "roles": {"implement": "cli-a"},
         }
+        if report_dir is not None:
+            config["report_dir"] = report_dir
         path = self.dir / "config.json"
         path.write_text(json.dumps(config), encoding="utf-8")
         return str(path)
@@ -82,7 +97,7 @@ class WbsTestCase(unittest.TestCase):
     def run_args(self, config, mode="ok", cli="cli-a"):
         """Command line and environment of `wbs.py run` as a separate process, as a scheduler starts it."""
         env = dict(os.environ, FAKE_CLI_RECORD=str(self.record), FAKE_CLI_MODE=mode, FAKE_SECRET=SECRET,
-                   FAKE_CLI_RELEASE=str(self.release))
+                   FAKE_CLI_RELEASE=str(self.release), FAKE_CLI_HEARTBEAT=str(self.heartbeat))
         return [sys.executable, str(SCRIPT), "--db", self.db, "run", "--config", config, "--cli", cli], env
 
     def run_cli(self, config, mode="ok", cli="cli-a"):
@@ -282,6 +297,66 @@ class PrivacyAndPermissionTest(WbsTestCase):
                 self.assertEqual(self.run_cli(config, cli=cli).returncode, wbs.EXIT_ERROR)
         self.assertEqual(self.calls(), [])
         self.assertEqual(self.cli("status")[1]["counts"], {"pending": 1})
+
+    def test_permissions_beyond_policy_a_and_unreviewed_wrapper_are_refused(self):
+        refused = (["--sandbox", "danger-full-access"], ["-a", "never"], ["--ask-for-approval=never"],
+                   ["--sandbox", "danger-full-access", "-a", "never"], ["-s", "workspace-write", "-s", "x", "-a", "never"],
+                   ["--approve-for-me"], ["--permission-mode", "bypassPermissions"],
+                   ["--permission-mode", "auto"], ["--permission-mode=auto"])
+        for extra_args in refused:
+            with self.subTest(args=extra_args), self.assertRaises(wbs.WbsError):
+                wbs.load_cli(self.write_config(extra_args), "cli-a")
+        allowed = (["--sandbox", "workspace-write", "--ask-for-approval", "on-request"],
+                   ["--sandbox", "workspace-write", "-a", "never"], ["-s", "read-only", "--ask-for-approval=never"],
+                   ["--permission-mode", "acceptEdits"], ["--permission-mode", "dontAsk"])
+        for extra_args in allowed:
+            with self.subTest(args=extra_args):
+                self.assertTrue(wbs.load_cli(self.write_config(extra_args), "cli-a"))
+        wrapper = [str(self.dir / "agent.cmd")]
+        with self.assertRaises(wbs.WbsError):
+            wbs.load_cli(self.write_config(argv=wrapper), "cli-a")
+        self.assertTrue(wbs.load_cli(self.write_config(argv=wrapper, wrapper_reviewed=True), "cli-a"))
+
+
+class ProcessTreeTest(WbsTestCase):
+    def assert_heartbeat_stopped(self):
+        self.assertTrue(self.heartbeat.exists(), "the stand-in never started its grandchild")
+        size = self.heartbeat.stat().st_size
+        time.sleep(1)
+        self.assertEqual(self.heartbeat.stat().st_size, size, "a process the CLI started is still running")
+
+    def test_timeout_ends_every_process_the_cli_started(self):
+        self.init([task("A")])
+        proc = self.run_cli(self.write_config(timeout=3), mode="spawn-hang")
+        out = json.loads(proc.stdout)
+        self.assertEqual((proc.returncode, out["result"], out["exit_code"]), (wbs.EXIT_BLOCKED, "failed", None))
+        self.assert_heartbeat_stopped()
+
+    def test_processes_left_after_a_normal_exit_are_ended(self):
+        self.init([task("A")])
+        out = json.loads(self.run_cli(self.write_config(), mode="spawn-exit").stdout)
+        self.assertEqual(out["result"], "awaiting_review")
+        self.assert_heartbeat_stopped()
+
+
+class ReportTest(WbsTestCase):
+    def test_report_status_decides_between_review_and_stop(self):
+        self.init([task("A"), task("B")])
+        config = self.write_config(report_dir=str(self.dir / "reports"))
+        out = json.loads(self.run_cli(config, mode="report-done").stdout)
+        self.assertEqual((out["result"], out["report"]), ("awaiting_review", "done"))
+        self.assertIn("Fictional report body", Path(out["report_file"]).read_text(encoding="utf-8"))
+        proc = self.run_cli(config, mode="report-needs-approval")
+        out = json.loads(proc.stdout)
+        self.assertEqual((proc.returncode, out["result"], out["exit_code"], out["report"]),
+                         (wbs.EXIT_BLOCKED, "failed", 0, "needs-approval"))
+        self.assertNotIn(b"Fictional report body", Path(self.db).read_bytes())  # only the status is kept
+
+    def test_missing_report_is_flagged_but_still_goes_to_review(self):
+        self.init([task("A")])
+        out = json.loads(self.run_cli(self.write_config(report_dir=str(self.dir / "reports"))).stdout)
+        self.assertEqual((out["result"], out["report"]), ("awaiting_review", "missing"))
+        self.assertIn("Report file: ", self.calls()[0]["prompt"])
 
 
 class FailureTest(WbsTestCase):

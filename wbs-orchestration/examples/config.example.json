@@ -1,5 +1,6 @@
 {
   "warning_dir": "wbs-warnings",
+  "report_dir": ".wbs-reports",
   "clis": {
     "builder": {
       "argv": ["<builder-cli-executable>", "<arguments that make it read the prompt from stdin>"],

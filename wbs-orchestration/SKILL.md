@@ -44,9 +44,43 @@ Out of scope:
   instructions of the project it works in.
 - Approvals stay with the user. Never add permission-bypass or auto-approve
   flags to a CLI command. `wbs.py` refuses any argument that contains
-  `dangerous`, `bypass`, `skip-permission`, `yolo` or `no-sandbox` (case is
-  ignored). That check is a guard, not a guarantee, so review every configured
+  `danger`, `bypass`, `skip-permission`, `yolo`, `no-sandbox` or
+  `approve-for-me` (case is ignored), `--permission-mode` set to `auto` or
+  `bypassPermissions`, and the value `never` after `-a` or after any flag whose
+  name contains `approval` unless every `-s`/`--sandbox` given is `read-only`
+  or `workspace-write` (see "Permission policy"). It also refuses a script
+  (`.cmd`, `.bat`, `.ps1`, `.sh`, `.vbs`) as `argv[0]` unless the entry sets
+  `"wrapper_reviewed": true`, because a script can add flags this check never
+  sees. That check is a guard, not a guarantee, so review every configured
   argument list with the user.
+- A CLI run by `run` has nobody to answer its approval prompts. Configure every
+  CLI for the permission policy below. Anything beyond it must make the CLI
+  stop and report `STATUS: needs-approval` (see "Report file").
+
+## Permission policy
+
+Every CLI that `run` starts follows policy A:
+
+- Without asking, it may read, edit files inside the project, and run the
+  commands the user listed for it (for example the project's test command).
+- Everything else, such as network access, writing outside the project,
+  publishing, pushing or deleting outside the project, is not approved in
+  advance. The CLI's own sandbox or permission mode must deny it, so the CLI
+  stops and reports `STATUS: needs-approval`.
+- Broader settings (an automatic classifier deciding for the user, or turning
+  sandbox and approvals off) are out of scope for this skill.
+
+Examples that fit policy A. Confirm each with the user and try it on a
+fictional plan first:
+
+| CLI | Arguments (prompt from stdin) | Notes |
+|---|---|---|
+| Codex | `codex exec --sandbox workspace-write --ask-for-approval never -` | `workspace-write` keeps network access off unless the user's configuration turns it on, and lets Codex write the working directory and temporary directories. `.git` stays read-only, so Codex cannot commit. With approvals off, an action outside the sandbox fails instead of waiting. Check that `codex exec` accepts `--ask-for-approval` in the installed version; otherwise set the approval policy in the user's Codex configuration |
+| Claude Code | `claude -p --permission-mode dontAsk --allowedTools "Edit" "Write" "Bash(<test command> *)"` | `dontAsk` denies every call that would otherwise prompt, and the session never waits for input. `acceptEdits` also fits: it approves edits only inside the working directory and common filesystem commands. Check that `claude -p` reads the prompt from stdin when no prompt argument is given |
+
+`wbs.py` refuses the settings that are clearly broader than policy A (see
+"Ground rules"). It cannot see settings that live in a CLI's configuration
+files, so review those with the user too.
 - Keep secrets and personal data out of plans, notes, review reasons, config and
   the database. CLIs read their own credentials from wherever they normally keep
   them. `wbs.py` passes its environment to the CLI unchanged. It does not store
@@ -61,8 +95,9 @@ Each project has its own files. Agree on their locations with the user:
 |---|---|---|
 | Plan JSON | Plan name, goal, tasks | Format in `examples/plan.example.json` |
 | State database | SQLite file given with `--db` | Created by `init`. `init` never overwrites an existing database |
-| Config JSON | `clis`, `roles`, `warning_dir` | Format in `examples/config.example.json` |
+| Config JSON | `clis`, `roles`, `warning_dir`, optional `report_dir` | Format in `examples/config.example.json` |
 | Warning folder | Warning files from `run` | `warning_dir` in the config. A relative path resolves from the config file's folder |
+| Report folder | Report files the CLI writes | `report_dir` in the config. A relative path resolves from the working directory of `run`, so it is inside the project |
 
 Plan rules, checked by `init`:
 - Top level: `plan.name` must be a non-empty string. `plan.goal` is an
@@ -77,10 +112,17 @@ Plan rules, checked by `init`:
 
 Config rules, checked by `run`. Only the CLI entry named by `--cli` is checked:
 - `clis.NAME.argv` must be a non-empty list of non-empty strings with no bypass
-  markers.
+  markers. A script as `argv[0]` also needs `clis.NAME.wrapper_reviewed: true`.
 - `clis.NAME.timeout_seconds` must be a positive integer. The default is 1800.
 - At least one role in `roles` must map to `NAME`.
 - `warning_dir` must be a non-empty string.
+- `report_dir`, when given, must be a non-empty string. Recommended for every
+  configuration.
+
+On Windows, a CLI installed as a `.cmd` launcher (common for npm packages) is
+not found by its bare name, because only `.exe` is appended when searching.
+Give the full path to the `.cmd` file and set `wrapper_reviewed` after reading
+it.
 
 No CLI handles a role that is not mapped in `roles`. People handle those roles
 with `claim` and `complete`.
@@ -203,13 +245,21 @@ In this order:
 4. Starts the CLI once, from `argv`, without a shell, and writes the prompt to
    stdin as UTF-8. stdout and stderr go to the null device. CLI output is
    discarded, and is never printed or stored. There is no automatic retry.
+   Every process the CLI starts is ended when the call ends, on timeout and
+   also after a normal exit. On Windows the CLI joins a Job Object that ends
+   all its processes when `wbs.py` closes it or when `wbs.py` itself is
+   killed; a process started in the moment before the CLI joined the job is
+   not covered, and if the job cannot be set up, `taskkill /T /F` is used on
+   timeout instead. On other systems the CLI leads its own process group,
+   which gets SIGKILL.
 5. Records the outcome on the attempt and the task:
 
 | CLI result | Task state | `exit_code` | Counted as a CLI start | `run` exit code |
 |---|---|---|---|---|
 | Exit code 0 | `awaiting_review` | `0` | Yes | `0` |
+| Exit code 0, report says `needs-approval` or `blocked` | `failed` | `0` | Yes | `3` |
 | Non-zero exit code | `failed` | That code | Yes | `3` |
-| Timeout (`timeout_seconds`) | `failed`, process killed | `null` | Yes | `3` |
+| Timeout (`timeout_seconds`) | `failed`, process tree ended | `null` | Yes | `3` |
 | Could not start (for example, executable not found) | `failed` | `null` | No | `3` |
 
 6. Counts the CLI processes that actually started for this task, across all
@@ -222,15 +272,32 @@ In this order:
    warning file is written after the outcome is saved, and `wbs.py` does not
    catch errors from writing it.
 7. Prints `result`, `task`, `attempt`, `exit_code`, `cli_invoked`,
-   `task_cli_calls` and `warning_file`.
+   `task_cli_calls`, `warning_file`, `report` and `report_file`.
 
 The prompt contains the plan name and goal, the task id, title and role, the
 ids of the completed prerequisites, the description, the acceptance criteria,
 and fixed rules. The rules tell the CLI to follow the project instructions, not
 to bypass approvals, not to expose secrets, to work only on this task, and to
-report what it changed and how it verified it. That report is part of the
-discarded output, so reviewers judge the changes in the project, not the CLI's
-own summary.
+report what it changed and how it verified it. Without `report_dir`, that
+report is part of the discarded output, so reviewers judge the changes in the
+project, not the CLI's own summary.
+
+### Report file
+
+With `report_dir` set, the prompt names a report file,
+`<report_dir>/<task>-attempt<N>.md`, and asks the CLI to write it before it
+exits. Its first line must be `STATUS: done`, `STATUS: needs-approval` or
+`STATUS: blocked`. The prompt also tells the CLI not to perform an action that
+needs approval, but to report `needs-approval` and exit.
+
+After exit code 0, `wbs.py` reads only the first line and records it as
+`report` (`done`, `needs-approval`, `blocked`, `missing` or `unrecognized`) in
+the attempt note. The rest of the file stays in the project for the reviewer
+and is never stored in the database. `needs-approval` and `blocked` make the
+task `failed`, which stops scheduling so a person looks at once. `missing` and
+`unrecognized` still go to `awaiting_review`, so the reviewer sees that the CLI
+did not report. The report is the CLI's own claim: reviewers still judge the
+changes in the project.
 
 Notes given to `complete` and `fail`, and the reviewer name with the note or
 reason given to `accept` and `reject`, are stored, truncated to 500 characters.
@@ -273,7 +340,12 @@ reason. After `reject` and `retry`, the CLI gets the same prompt as before.
   the task's description already names. You cannot change the description after
   `init`.
 - Ask in the acceptance criteria for durable evidence in the project, such as
-  tests, files or commits, because the CLI's console report is discarded.
+  tests, files or commits, because the CLI's console report is discarded. Under
+  policy A a sandboxed CLI may be unable to commit (Codex keeps `.git`
+  read-only), so prefer files and tests, and let a person commit.
+- Keep `report_dir` out of version control, for example with `.gitignore`.
+- Report files are named per attempt, so a retried task writes a new one. The
+  earlier reports stay in `report_dir` for the reviewer.
 
 ## Scheduling
 
@@ -310,6 +382,12 @@ reason. After `reject` and `retry`, the CLI gets the same prompt as before.
   Take the attempt id from the `blocked` reason of a later `run`, which names
   the open attempt and task ids, or read the `attempts` table with a read-only
   SQLite query.
+- On Windows, when `wbs.py` is killed (for example by the scheduler's time
+  limit), the Job Object ends the CLI and everything it started, so the
+  interrupted CLI does not keep editing the project. The attempt still stays
+  open and needs the steps above. On other systems, a `wbs.py` killed with
+  SIGKILL does not end the CLI's process group; check for and end it before
+  `retry`.
 
 ## HTML status report
 
@@ -391,10 +469,17 @@ They cover:
 - Approval tasks left for a person.
 - The per-task count and the warning at each task's fifth start.
 - The prompt on stdin, and CLI output that is neither printed nor stored.
-- Refusal of bypass arguments and unconfigured CLIs.
+- Refusal of bypass arguments and unconfigured CLIs, including
+  `danger-full-access`, `--permission-mode auto`, `never` after an approval
+  flag without a confining sandbox, and a script as `argv[0]` without
+  `wrapper_reviewed`. Settings that fit policy A (`workspace-write` with
+  `never`, `acceptEdits`, `dontAsk`) are accepted.
 - Failure stopping all scheduling until `retry`.
 - A CLI that cannot start, which is not counted.
 - A timeout, which is counted and not retried.
+- Processes the CLI started are ended on timeout and after a normal exit.
+- Report files: `done` goes to review, `needs-approval` fails the task, a
+  missing report is flagged, and the report body is not stored.
 - The review gate: exit code 0 needs `accept`, `complete` is refused, and
   `reject` blocks until `retry`.
 - `render_wbs.py`: escaped titles and plan name, every task row in plan

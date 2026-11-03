@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
 from collections import Counter
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,7 +24,20 @@ EXIT_OK, EXIT_ERROR, EXIT_BLOCKED = 0, 1, 3
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TASK_KEYS = {"id", "title", "role", "description", "acceptance", "depends_on", "requires_approval"}
 # A guard against obvious permission bypass, not a guarantee: review every configured argv.
-BYPASS_MARKERS = ("dangerous", "bypass", "skip-permission", "yolo", "no-sandbox")
+# "danger" also covers values such as "danger-full-access", not only "--dangerously-...".
+BYPASS_MARKERS = ("danger", "bypass", "skip-permission", "yolo", "no-sandbox", "approve-for-me")
+# Permission policy A: a CLI may write inside the project without asking; anything else the
+# CLI itself must refuse or stop on. These permission modes approve more than that.
+PERMISSION_MODE_FLAG = re.compile(r"^--permission-mode$")
+BROAD_PERMISSION_MODES = {"auto", "bypasspermissions"}
+# Flags whose value "never" turns approval prompts off ("-a never", "--ask-for-approval=never").
+# That is only allowed together with an explicit sandbox that confines the CLI to the project.
+APPROVAL_FLAG = re.compile(r"^(-a|--[a-z-]*approval[a-z-]*)$")
+SANDBOX_FLAG = re.compile(r"^(-s|--sandbox)$")
+CONFINED_SANDBOXES = {"read-only", "workspace-write"}
+# A script as argv[0] can add flags that this check never sees.
+WRAPPER_SUFFIXES = (".cmd", ".bat", ".ps1", ".sh", ".vbs")
+REPORT_STATUS = re.compile(r"^STATUS:\s*(done|needs-approval|blocked)\s*$", re.IGNORECASE)
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -299,9 +314,12 @@ def load_cli(config_path: str, name: str) -> dict:
     argv = entry.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
         raise WbsError(f"cli {name!r}: argv must be a non-empty list of strings")
-    bypass = [a for a in argv if any(m in a.lower() for m in BYPASS_MARKERS)]
+    bypass = bypass_arguments(argv)
     if bypass:
         raise WbsError(f"cli {name!r}: refusing permission-bypass arguments {bypass}")
+    if Path(argv[0]).suffix.lower() in WRAPPER_SUFFIXES and entry.get("wrapper_reviewed") is not True:
+        raise WbsError(f"cli {name!r}: argv[0] is a script whose own arguments are not checked;"
+                       " review it with the user, then set \"wrapper_reviewed\": true")
     timeout = entry.get("timeout_seconds", 1800)
     if not isinstance(timeout, int) or timeout <= 0:
         raise WbsError(f"cli {name!r}: timeout_seconds must be a positive integer")
@@ -311,11 +329,50 @@ def load_cli(config_path: str, name: str) -> dict:
     warning_dir = cfg.get("warning_dir")
     if not isinstance(warning_dir, str) or not warning_dir:
         raise WbsError("config needs 'warning_dir', a folder chosen by the user")
+    report_dir = cfg.get("report_dir")
+    if report_dir is not None and (not isinstance(report_dir, str) or not report_dir):
+        raise WbsError("'report_dir' must be a non-empty string when given")
     return {"argv": argv, "timeout": timeout, "roles": roles,
-            "warning_dir": Path(config_path).resolve().parent / warning_dir}
+            "warning_dir": Path(config_path).resolve().parent / warning_dir,
+            # Relative to the project (the working directory of `run`), so the CLI may write there.
+            "report_dir": Path(report_dir).resolve() if report_dir else None}
 
 
-def build_prompt(conn, task) -> str:
+def flag_values(argv, flag_pattern) -> list:
+    """(argument as written, lower-case value) for each use of a flag, as --flag=value or --flag value."""
+    found = []
+    for i, arg in enumerate(argv):
+        flag, eq, value = arg.partition("=")
+        if not flag_pattern.match(flag.lower()):
+            continue
+        if not eq:
+            value = argv[i + 1] if i + 1 < len(argv) else ""
+        found.append((arg if eq else f"{arg} {value}", value.lower()))
+    return found
+
+
+def bypass_arguments(argv) -> list:
+    """Arguments that turn permission or approval checks off beyond permission policy A."""
+    found = [a for a in argv if any(m in a.lower() for m in BYPASS_MARKERS)]
+    found += [shown for shown, value in flag_values(argv, PERMISSION_MODE_FLAG) if value in BROAD_PERMISSION_MODES]
+    sandboxes = [value for _, value in flag_values(argv, SANDBOX_FLAG)]
+    if not sandboxes or not all(value in CONFINED_SANDBOXES for value in sandboxes):
+        found += [shown for shown, value in flag_values(argv, APPROVAL_FLAG) if value == "never"]
+    return found
+
+
+def read_report_status(path: Path) -> str:
+    """Read only the first line of the CLI's report; the rest stays in the project for the reviewer."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            first = f.readline(200)
+    except (OSError, UnicodeDecodeError):
+        return "missing"
+    match = REPORT_STATUS.match(first.strip())
+    return match.group(1).lower() if match else "unrecognized"
+
+
+def build_prompt(conn, task, report=None) -> str:
     meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
     deps = [r[0] for r in conn.execute(
         "SELECT depends_on FROM deps WHERE task_id = ? ORDER BY depends_on", (task["id"],))]
@@ -339,7 +396,100 @@ def build_prompt(conn, task) -> str:
         "- Do not print, store or send secrets or personal data.",
         "- Work only on this task. Report what you changed and how you verified it.",
     ]
+    if report is not None:
+        lines += [
+            f"- Before you exit, write your report to the file named on the next line. Its first line must be"
+            " exactly one of: STATUS: done / STATUS: needs-approval / STATUS: blocked.",
+            f"Report file: {report}",
+            "- If an action needs user approval, do not do it: write STATUS: needs-approval with the reason, then exit.",
+        ]
     return "\n".join(lines) + "\n"
+
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+
+    class _BasicLimit(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class _ExtendedLimit(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _BasicLimit), ("IoInfo", _IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    _kernel32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    _kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    _kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    def _job_for(proc):
+        """A job that ends every process in it when its last handle closes, with proc assigned to it."""
+        job = _kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _ExtendedLimit()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not (_kernel32.SetInformationJobObject(job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                                                  ctypes.byref(info), ctypes.sizeof(info))
+                # Popen keeps the process handle in the private _handle attribute on Windows.
+                and _kernel32.AssignProcessToJobObject(job, int(proc._handle))):
+            _kernel32.CloseHandle(job)
+            return None
+        return job
+
+
+class ProcessTree:
+    """End a CLI together with every process it started.
+
+    Windows: the CLI joins a Job Object with KILL_ON_JOB_CLOSE, so closing the job,
+    or wbs.py itself being killed, ends the whole tree. A process the CLI starts in
+    the moment before it joins the job is not covered. If the job cannot be set
+    up, `taskkill /T /F` is used on timeout instead.
+    POSIX: the CLI leads its own session, and the whole process group gets SIGKILL."""
+
+    def __init__(self, proc):
+        self.proc, self.job = proc, None
+        self.method = "process group"
+        if os.name == "nt":
+            self.job = _job_for(proc)
+            self.method = "job object" if self.job else "taskkill /T"
+
+    def kill(self) -> None:
+        if self.job:
+            _kernel32.TerminateJobObject(self.job, 1)
+        elif os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(self.proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        else:
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.proc.pid, signal.SIGKILL)
+        self.proc.kill()
+        self.proc.wait()
+
+    def close(self) -> None:
+        """End anything the CLI left running, also after a normal exit."""
+        if self.job:
+            _kernel32.CloseHandle(self.job)
+            self.job = None
+        elif os.name != "nt":
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.proc.pid, signal.SIGKILL)
 
 
 def invoke(argv, prompt, timeout, on_start):
@@ -347,21 +497,26 @@ def invoke(argv, prompt, timeout, on_start):
 
     CLI stdout and stderr go to the null device: they are never printed or stored.
     on_start runs once the process exists, so only real starts are counted.
+    Every process the CLI started is ended before this returns (see ProcessTree).
     Returns (started, exit_code or None, fixed note without output). There is no
     retry here: a failure or timeout is final for this run."""
+    extra = {} if os.name == "nt" else {"start_new_session": True}
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, encoding="utf-8")
+                                stderr=subprocess.DEVNULL, encoding="utf-8", **extra)
     except OSError as exc:
         return False, None, f"cli could not start ({type(exc).__name__})"
-    on_start()
+    tree = ProcessTree(proc)
     try:
-        proc.communicate(prompt, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        return True, None, f"timeout after {timeout}s"
-    return True, proc.returncode, f"exit code {proc.returncode}"
+        on_start()
+        try:
+            proc.communicate(prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            tree.kill()
+            return True, None, f"timeout after {timeout}s; ended by {tree.method}"
+        return True, proc.returncode, f"exit code {proc.returncode}"
+    finally:
+        tree.close()
 
 
 def write_warning(folder: Path, task_id: str, calls: int, db_name: str) -> str:
@@ -481,17 +636,27 @@ def cmd_run(conn, args) -> int:
         reason = f"ready tasks need user approval or another cli: {ready}" if ready else idle_reason(conn)
         emit({"result": "idle", "reason": reason, "cli_invoked": False})
         return EXIT_OK
-    started, exit_code, note = invoke(cli["argv"], build_prompt(conn, task), cli["timeout"],
+    report = None
+    if cli["report_dir"] is not None:
+        cli["report_dir"].mkdir(parents=True, exist_ok=True)
+        report = cli["report_dir"] / f"{task['id']}-attempt{attempt}.md"
+    started, exit_code, note = invoke(cli["argv"], build_prompt(conn, task, report), cli["timeout"],
                                       on_start=lambda: mark_started(conn, attempt))
+    report_status = read_report_status(report) if report is not None and exit_code == 0 else None
+    if report_status:
+        note += f"; report: {report_status}"
     # Exit code 0 only means the CLI says it finished; a reviewer decides with accept/reject.
-    outcome = "awaiting_review" if exit_code == 0 else "failed"
+    # A CLI that reports it stopped for approval or was blocked fails, so a person looks at once.
+    stopped = report_status in ("needs-approval", "blocked")
+    outcome = "awaiting_review" if exit_code == 0 and not stopped else "failed"
     finish(conn, attempt, outcome, note, exit_code)
     calls = task_cli_calls(conn, task["id"])
     warning = None
     if started and calls % WARN_EVERY == 0:
         warning = write_warning(cli["warning_dir"], task["id"], calls, Path(args.db).name)
     emit({"result": outcome, "task": task["id"], "attempt": attempt, "exit_code": exit_code,
-          "cli_invoked": started, "task_cli_calls": calls, "warning_file": warning})
+          "cli_invoked": started, "task_cli_calls": calls, "warning_file": warning,
+          "report": report_status, "report_file": str(report) if report is not None else None})
     return EXIT_OK if outcome == "awaiting_review" else EXIT_BLOCKED
 
 
