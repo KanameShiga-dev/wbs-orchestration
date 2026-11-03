@@ -1,0 +1,40 @@
+{
+  "plan": {
+    "name": "Fictional bookmark search",
+    "goal": "Add keyword search to a fictional bookmark manager."
+  },
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Write the search design note",
+      "role": "planner",
+      "description": "Describe search inputs, outputs and limits.",
+      "acceptance": "The note lists inputs, outputs and at least one non-goal."
+    },
+    {
+      "id": "T2",
+      "title": "Implement keyword search",
+      "role": "implementer",
+      "depends_on": ["T1"],
+      "description": "Add a search function that follows the design note.",
+      "acceptance": "Unit tests cover no match, one match and several matches."
+    },
+    {
+      "id": "T3",
+      "title": "Review the search change",
+      "role": "reviewer",
+      "depends_on": ["T2"],
+      "description": "Review correctness, privacy and test coverage of T2.",
+      "acceptance": "Findings are listed with severity, or the review states none were found."
+    },
+    {
+      "id": "T4",
+      "title": "Decide whether to merge",
+      "role": "owner",
+      "depends_on": ["T3"],
+      "requires_approval": true,
+      "description": "A person reads the review and decides.",
+      "acceptance": "The decision is recorded with complete or fail."
+    }
+  ]
+}
