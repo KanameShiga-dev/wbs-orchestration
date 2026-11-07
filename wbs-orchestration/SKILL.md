@@ -19,8 +19,9 @@ In scope:
 - Creating the state database, dispatching tasks to configured CLIs, and
   recording claims, attempts, review verdicts and events.
 - Stopping all scheduling when a task fails, until a person runs `retry`.
-- Allowing at most one open CLI attempt per database. Manual claims are not
-  limited by it.
+- Allowing one open CLI attempt per database by default, or several when the
+  config sets limits (see "Running CLIs in parallel"). Manual claims are not
+  limited by either.
 
 Out of scope:
 - Installing CLIs or storing credentials. This package is a skill,
@@ -95,7 +96,7 @@ Each project has its own files. Agree on their locations with the user:
 |---|---|---|
 | Plan JSON | Plan name, goal, tasks | Format in `examples/plan.example.json` |
 | State database | SQLite file given with `--db` | Created by `init`. `init` never overwrites an existing database |
-| Config JSON | `clis`, `roles`, `warning_dir`, optional `report_dir` | Format in `examples/config.example.json` |
+| Config JSON | `clis`, `roles`, `warning_dir`, optional `report_dir` and `max_parallel` | Format in `examples/config.example.json` |
 | Warning folder | Warning files from `run` | `warning_dir` in the config. A relative path resolves from the config file's folder |
 | Report folder | Report files the CLI writes | `report_dir` in the config. A relative path resolves from the working directory of `run`, so it is inside the project |
 
@@ -103,12 +104,14 @@ Plan rules, checked by `init`:
 - Top level: `plan.name` must be a non-empty string. `plan.goal` is an
   optional string. `tasks` must be a non-empty list.
 - Allowed task keys: `id`, `title`, `role`, `description`, `acceptance`,
-  `depends_on`, `requires_approval`. Any other key is rejected.
+  `depends_on`, `requires_approval`, `writes`. Any other key is rejected.
 - `id` and `role` must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`. Ids must be
   unique. `title` must not be empty.
 - `depends_on` is a list of unique, existing task ids. Cycles are rejected.
 - `requires_approval` is `true` or `false` (default `false`). `description` and
   `acceptance` are strings (default empty).
+- `writes`, when given, is a list of paths or globs relative to the working
+  directory. An absolute path, a drive or `..` is rejected.
 
 Config rules, checked by `run`. Only the CLI entry named by `--cli` is checked:
 - `clis.NAME.argv` must be a non-empty list of non-empty strings with no bypass
@@ -118,6 +121,8 @@ Config rules, checked by `run`. Only the CLI entry named by `--cli` is checked:
 - `warning_dir` must be a non-empty string.
 - `report_dir`, when given, must be a non-empty string. Recommended for every
   configuration.
+- `max_parallel`, when given at the top level, must be a positive integer.
+  `clis.NAME.max_parallel`, when given, must be an integer from 1 to 3.
 
 On Windows, a CLI installed as a `.cmd` launcher (common for npm packages) is
 not found by its bare name, because only `.exe` is appended when searching.
@@ -146,9 +151,11 @@ inherits the working directory and environment of the `wbs.py` process. Start
 4. **Configure.** Write the config with the user. Map roles to CLI names. Leave
    person-only roles unmapped.
 5. **Run.** Each `run --cli NAME` claims at most one ready task, starts the
-   CLI once, and records the result. While any CLI attempt in the database is
-   still open, for any task and any CLI name, `run` starts no CLI and exits
-   `blocked`. Repeat by hand or from a scheduler the user sets up.
+   CLI once, and records the result. By default, while any CLI attempt in the
+   database is still open, for any task and any CLI name, `run` starts no CLI
+   and exits `blocked`. With limits in the config, it can start next to running
+   attempts (see "Running CLIs in parallel"). Repeat by hand or from a
+   scheduler the user sets up.
 6. **Review.** A task that exits with code 0 becomes `awaiting_review`. The
    reviewer the user assigned (a person, or an agent such as Codex) inspects
    the work in the project, then runs `accept` (the task becomes `done` and
@@ -184,7 +191,7 @@ Errors print one line, `error: ...`, to stderr and no JSON.
 | Command | Effect |
 |---|---|
 | `init --plan FILE` | Create the database from a plan. Fails if the database file already exists |
-| `status` | Plan name, counts per state, ready ids, total CLI starts (`cli_invocations`), and each task with its own `cli_calls` |
+| `status` | Plan name, counts per state, ready ids, total CLI starts (`cli_invocations`), open attempts (`open_attempts`: attempt, task, worker, cli, start time, and `running`, which is `null` for manual attempts), and each task with its own `cli_calls` |
 | `ready` | Ready tasks with id, title, role and `requires_approval` |
 | `claim --worker NAME [--task ID]` | Claim the first ready task, or the given ready task, for a person or agent. No role filter. Prints the attempt id |
 | `complete --attempt N [--note TEXT]` | Mark a non-CLI attempt `done`. Refused for attempts started by `run` |
@@ -198,10 +205,10 @@ Exit codes:
 
 | Code | Meaning |
 |---|---|
-| `0` | Success. This includes `"result": "idle"` and `run` ending in `awaiting_review` |
-| `1` | Invalid input or state: bad plan or config, database exists or is missing, task not ready or not awaiting review, attempt unknown or already finished, `complete` on a CLI attempt |
+| `0` | Success. This includes `"result": "idle"`, `"result": "busy"` and `run` ending in `awaiting_review` |
+| `1` | Invalid input or state: bad plan or config, database exists, is missing or was created by an older `wbs.py`, task not ready or not awaiting review, attempt unknown or already finished, `complete` on a CLI attempt |
 | `2` | Usage error from argument parsing |
-| `3` | `"result": "blocked"` from `claim` or `run` because a task is `failed`, from `run` because a CLI attempt is open, or `run` whose CLI call ended `failed` |
+| `3` | `"result": "blocked"` from `claim` or `run` because a task is `failed`, from `run` because a CLI attempt is open (without limits) or no longer running (with limits), or `run` whose CLI call ended `failed` |
 
 Examples with the bundled examples. Replace `<skill>` with this skill's
 directory. Run `run` from the project directory.
@@ -230,12 +237,13 @@ In this order:
 1. Loads the config and checks the entry named by `--cli`. Any config error
    exits with code 1 before a task is claimed.
 2. In one `BEGIN IMMEDIATE` transaction, checks for failed tasks and open CLI
-   attempts, then claims a task. If any task is `failed`, or any CLI attempt
-   (for any task, from any CLI name) has not ended, it prints
+   attempts, then claims a task. If any task is `failed`, or, by default, any
+   CLI attempt (for any task, from any CLI name) has not ended, it prints
    `"result": "blocked"` with `"cli_invoked": false` and exits with code 3.
    Otherwise it claims the first ready task in plan order whose role maps to
-   this CLI and whose `requires_approval` is `false`. So at most one CLI runs
-   per database at a time. Attempts opened by `claim` do not count.
+   this CLI and whose `requires_approval` is `false`. So by default at most one
+   CLI runs per database at a time. With limits in the config, this step
+   follows "Running CLIs in parallel". Attempts opened by `claim` do not count.
 3. If no task matches, it prints `"result": "idle"` with `"cli_invoked": false`
    and exits with code 0. The `reason` is one of the following:
    - `ready tasks need user approval or another cli: [...]`
@@ -278,7 +286,8 @@ The prompt contains the plan name and goal, the task id, title and role, the
 ids of the completed prerequisites, the description, the acceptance criteria,
 and fixed rules. The rules tell the CLI to follow the project instructions, not
 to bypass approvals, not to expose secrets, to work only on this task, and to
-report what it changed and how it verified it. Without `report_dir`, that
+report what it changed and how it verified it. A task with `writes` is also told
+to change only those paths, or no project file when the list is empty. Without `report_dir`, that
 report is part of the discarded output, so reviewers judge the changes in the
 project, not the CLI's own summary.
 
@@ -359,18 +368,21 @@ reason. After `reject` and `retry`, the CLI gets the same prompt as before.
   the user authorized for that job.
 - Interpret exit codes in the job:
   - `0` with `idle`: nothing to do, or waiting for review or approval.
+  - `0` with `busy`: a parallel limit or a write overlap makes this run wait.
+    Try again later.
   - `0` with `awaiting_review`: a reviewer is needed.
-  - `3`: a task is `failed`, a CLI attempt is still open, or this run's CLI
-    call failed. A person must act. Further runs start no CLI until the
-    cause is cleared, but notify the user instead of hiding the code.
+  - `3`: a task is `failed`, a CLI attempt is still open or was interrupted, or
+    this run's CLI call failed. A person must act. Further runs start no CLI
+    until the cause is cleared, but notify the user instead of hiding the code.
   - `1`: fix the config or state.
-- Only one CLI attempt per database can be open at a time. A `run` that
-  starts while another is open, even for a different task or CLI name, exits
-  `blocked` (code 3) without starting a CLI. Independent tasks therefore run
-  one after another on CLIs. Manual `claim` attempts do not count toward this
-  limit and are not blocked by it, so a person or agent working on a claimed
-  task can edit the same working tree while a CLI runs. Coordinate that by
-  hand, for example with separate worktrees.
+- By default only one CLI attempt per database can be open at a time. A `run`
+  that starts while another is open, even for a different task or CLI name,
+  exits `blocked` (code 3) without starting a CLI. Independent tasks therefore
+  run one after another on CLIs unless the config sets limits (see "Running
+  CLIs in parallel"). Manual `claim` attempts do not count toward any limit and
+  are not blocked by one, so a person or agent working on a claimed task can
+  edit the same working tree while a CLI runs. Coordinate that by hand, for
+  example with separate worktrees.
 - Act on warning files: check progress, cost and quota before you let the
   schedule continue.
 - If `wbs.py` is interrupted during a CLI call, the attempt stays open and the
@@ -378,16 +390,76 @@ reason. After `reject` and `retry`, the CLI gets the same prompt as before.
   tasks, and nothing closes or retries it automatically. Manual `claim` is not
   blocked. A person investigates the work the interrupted CLI left, closes the
   attempt with `fail --attempt N --reason TEXT` (the task becomes `failed`),
-  fixes the cause, then runs `retry --task ID`. No command lists attempts.
-  Take the attempt id from the `blocked` reason of a later `run`, which names
-  the open attempt and task ids, or read the `attempts` table with a read-only
-  SQLite query.
+  fixes the cause, then runs `retry --task ID`. Take the attempt id from
+  `status` (`open_attempts`) or from the `blocked` reason of a later `run`.
 - On Windows, when `wbs.py` is killed (for example by the scheduler's time
   limit), the Job Object ends the CLI and everything it started, so the
   interrupted CLI does not keep editing the project. The attempt still stays
   open and needs the steps above. On other systems, a `wbs.py` killed with
   SIGKILL does not end the CLI's process group; check for and end it before
   `retry`.
+
+## Running CLIs in parallel
+
+By default nothing runs side by side. To let a free CLI start while another
+works, set limits in the config and declare what each task writes in the plan:
+
+```json
+{
+  "max_parallel": 2,
+  "clis": {
+    "builder": {"argv": ["<builder-cli-executable>"], "max_parallel": 1},
+    "checker": {"argv": ["<checker-cli-executable>"], "max_parallel": 1}
+  }
+}
+```
+
+| Key | Meaning | Default |
+|---|---|---|
+| `max_parallel` (top level) | Open CLI attempts allowed in this database | `1` |
+| `clis.NAME.max_parallel` | Open attempts allowed for this CLI, from 1 to 3 | `1` |
+
+Setting either key turns on the behavior below. A top-level value above the sum
+of the CLI limits has no effect, because the CLI limits are reached first.
+
+An orchestrator, such as a scheduler or a UI, may call `run` at the same time
+for different CLI names, or for one CLI name up to its limit. It must not run
+`accept`, `reject` or `retry`. Everything else stays as it is: exit code 0 only
+means `awaiting_review`, `requires_approval` tasks are never dispatched, and
+policy A and the argument checks apply to every start. The transaction in `run`
+keeps two runs from taking the same task.
+
+`run` decides in this order:
+
+1. A `failed` task: `blocked`, code 3. CLIs already running are not stopped.
+   They finish and their results are recorded.
+2. An open CLI attempt whose `wbs.py run` no longer exists: `blocked`, code 3. A
+   person closes it with `fail`, as in "Scheduling". `wbs.py` compares the
+   process id and start time recorded for the attempt, and treats anything it
+   cannot read as not running.
+3. A limit reached: `busy`, code 0, and the `reason` names the limit and the open
+   attempts.
+4. No ready task for this CLI: `idle`, code 0.
+5. The first ready task in plan order that has no write overlap with a running
+   task starts. If every candidate overlaps: `busy`, code 0.
+
+Write overlap, from the task key `writes`:
+
+| `writes` | Meaning | Runs next to |
+|---|---|---|
+| Not given | Unknown | Nothing: it starts only when no CLI attempt is open, and blocks others while it runs |
+| `[]` | Writes no project file, for example a review that only writes its report file | Any task that has `writes` |
+| Paths or globs | Writes only there | Tasks whose paths do not overlap |
+
+Paths are compared per folder and without case. A glob counts as everything
+under the part before its first wildcard, so `src/*.py` overlaps all of `src`,
+and `*.py` overlaps everything. A doubtful pair therefore waits.
+
+`writes` is a declaration, not a sandbox. The prompt tells the CLI to stay inside
+it, but `wbs.py` does not check which files changed. Reviewers should compare the
+change with `writes`. Manual `claim` attempts are not compared with it. Attempts
+that have ended are not compared either, so changes awaiting review may sit next
+to a new run. Use separate worktrees yourself if a task needs stronger isolation.
 
 ## HTML status report
 
@@ -437,7 +509,9 @@ argument. The script paths come from the script's own folder.
   limited rights. No password is asked for or stored.
 - `-MultipleInstances IgnoreNew`: a start is skipped while the previous run of
   the same task is still going. The first start is one minute after
-  registration, then one every `-IntervalMinutes`.
+  registration, then one every `-IntervalMinutes`. One scheduled task therefore
+  runs one CLI at a time. For parallel runs, register a task per CLI name, and
+  more than one for a CLI whose `max_parallel` is above 1.
 - `-TimeLimitMinutes` (default 120) stops a run that takes longer. Set it above
   the CLI's `timeout_seconds`. A run stopped mid-CLI leaves an open attempt
   that blocks every later run, for all tasks, until a person investigates it,
@@ -480,6 +554,13 @@ They cover:
 - Processes the CLI started are ended on timeout and after a normal exit.
 - Report files: `done` goes to review, `needs-approval` fails the task, a
   missing report is flagged, and the report body is not stored.
+- Parallel runs: a free CLI starts next to a working one, a limit answers `busy`,
+  simultaneous runs take different tasks, a failure stops new runs while a
+  running CLI finishes, a killed `run` and a reused process id are `blocked`,
+  counts and warnings stay right, and invalid limits and older databases are
+  refused.
+- `writes`: validation, overlap rules, a free task chosen over an overlapping
+  one, tasks without `writes` running alone, and `[]` running next to others.
 - The review gate: exit code 0 needs `accept`, `complete` is refused, and
   `reject` blocks until `retry`.
 - `render_wbs.py`: escaped titles and plan name, every task row in plan

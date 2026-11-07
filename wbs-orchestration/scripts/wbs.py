@@ -16,13 +16,15 @@ import sys
 from collections import Counter
 from contextlib import closing, contextmanager, suppress
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 WARN_EVERY = 5
 NOTE_MAX = 500
 EXIT_OK, EXIT_ERROR, EXIT_BLOCKED = 0, 1, 3
+MAX_PARALLEL_PER_CLI = 3
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-TASK_KEYS = {"id", "title", "role", "description", "acceptance", "depends_on", "requires_approval"}
+TASK_KEYS = {"id", "title", "role", "description", "acceptance", "depends_on", "requires_approval", "writes"}
+WILDCARDS = set("*?[")
 # A guard against obvious permission bypass, not a guarantee: review every configured argv.
 # "danger" also covers values such as "danger-full-access", not only "--dangerously-...".
 BYPASS_MARKERS = ("danger", "bypass", "skip-permission", "yolo", "no-sandbox", "approve-for-me")
@@ -49,6 +51,7 @@ CREATE TABLE tasks (
     description TEXT NOT NULL,
     acceptance TEXT NOT NULL,
     requires_approval INTEGER NOT NULL,
+    writes TEXT,
     status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'awaiting_review', 'done', 'failed'))
 );
 CREATE TABLE deps (
@@ -62,6 +65,8 @@ CREATE TABLE attempts (
     worker TEXT NOT NULL,
     cli TEXT,
     cli_started INTEGER NOT NULL DEFAULT 0,
+    runner_pid INTEGER,
+    runner_start TEXT,
     started_at TEXT NOT NULL,
     ended_at TEXT,
     outcome TEXT CHECK (outcome IN ('awaiting_review', 'done', 'failed')),
@@ -86,13 +91,24 @@ WHERE t.status = 'pending' AND NOT EXISTS (
 ORDER BY t.position
 """
 
+OPEN_CLI_SQL = """
+SELECT a.id, a.task_id, a.cli, a.runner_pid, a.runner_start, t.writes
+FROM attempts a JOIN tasks t ON t.id = a.task_id
+WHERE a.cli IS NOT NULL AND a.ended_at IS NULL
+ORDER BY a.id
+"""
+
 
 class WbsError(Exception):
     """Invalid input or state. Reported as one line, without a traceback."""
 
 
 class Blocked(Exception):
-    """A failed task stops all claims until a person runs `retry`."""
+    """A person must act: a task failed, or an open CLI attempt cannot be trusted."""
+
+
+class Busy(Exception):
+    """A parallel limit or a write overlap makes this run wait. Nothing is wrong."""
 
 
 def now() -> str:
@@ -176,9 +192,27 @@ def validate_plan(data):
         if not all(isinstance(v, str) for v in texts.values()):
             raise WbsError(f"task {tid}: description and acceptance must be strings")
         tasks.append({"id": tid, "title": title.strip(), "role": role, "depends_on": deps,
-                      "requires_approval": approval, **texts})
+                      "requires_approval": approval, "writes": validate_writes(tid, raw), **texts})
     check_graph(tasks)
     return {"name": plan["name"].strip(), "goal": goal.strip()}, tasks
+
+
+def validate_writes(tid, raw):
+    """Return the task's write patterns with forward slashes, or None when the key is absent.
+
+    None and [] differ: None means the writes are unknown, so the task runs alone;
+    [] means the task writes no project file."""
+    if "writes" not in raw:
+        return None
+    writes = raw["writes"]
+    if not isinstance(writes, list) or not all(isinstance(p, str) and p.strip() for p in writes):
+        raise WbsError(f"task {tid}: writes must be a list of non-empty paths or globs")
+    normalized = [p.strip().replace("\\", "/") for p in writes]
+    for pattern in normalized:
+        path = PureWindowsPath(pattern)
+        if path.drive or path.root or ".." in path.parts:
+            raise WbsError(f"task {tid}: writes entry {pattern!r} must stay inside the working directory")
+    return normalized
 
 
 def check_graph(tasks):
@@ -215,23 +249,79 @@ def idle_reason(conn) -> str:
     return "all tasks done" if open_count == 0 else "no ready task"
 
 
-def claim(conn, worker, cli=None, task_id=None, select=None):
+def write_scope(pattern) -> tuple:
+    """The folders and file a write pattern is certain to stay under, compared without case."""
+    scope = []
+    for part in PurePosixPath(pattern).parts:
+        if WILDCARDS & set(part):
+            break
+        scope.append(part.casefold())
+    return tuple(scope)
+
+
+def writes_overlap(first, second) -> bool:
+    """Whether two write lists may touch the same file. None (unknown writes) overlaps everything.
+
+    Globs are compared by the part before the first wildcard, so a doubtful pair counts as overlapping."""
+    if first is None or second is None:
+        return True
+    scopes = [write_scope(p) for p in second]
+    for scope in map(write_scope, first):
+        for other in scopes:
+            shared = min(len(scope), len(other))
+            if scope[:shared] == other[:shared]:
+                return True
+    return False
+
+
+def stored_writes(value):
+    return None if value is None else json.loads(value)
+
+
+def attempt_running(attempt) -> bool:
+    """Whether the `wbs.py run` that opened this attempt still exists. Unknown counts as not running."""
+    return (attempt["runner_start"] is not None
+            and process_start(attempt["runner_pid"]) == attempt["runner_start"])
+
+
+def check_parallel_limits(open_cli, cli, limits) -> None:
+    """Raise Blocked for an interrupted attempt, Busy when a limit is reached."""
+    interrupted = [(a["id"], a["task_id"]) for a in open_cli if not attempt_running(a)]
+    if interrupted:
+        raise Blocked(f"open CLI attempt(s) {interrupted} (attempt, task) are no longer running:"
+                      " inspect their work, then `fail --attempt ID`")
+    running = [(a["id"], a["task_id"], a["cli"]) for a in open_cli]
+    if len(running) >= limits["total"]:
+        raise Busy(f"database limit reached ({len(running)} of {limits['total']});"
+                   f" open attempts (attempt, task, cli): {running}")
+    own = [a for a in running if a[2] == cli]
+    if len(own) >= limits["cli"]:
+        raise Busy(f"limit of cli {cli!r} reached ({len(own)} of {limits['cli']});"
+                   f" open attempts (attempt, task, cli): {running}")
+
+
+def claim(conn, worker, cli=None, task_id=None, select=None, limits=None):
     """Atomically claim one ready task. Returns (task_row, attempt_id) or (None, None).
 
-    A CLI claim (cli is set) is refused while any CLI attempt in this database is
-    still open, whatever its task: at most one CLI run per database. An attempt
-    left open by a crash keeps blocking until a person closes it with `fail`, so
-    an uncertain run is never retried automatically. Manual claims are not limited."""
+    A CLI claim (cli is set) with no limits is refused while any CLI attempt in
+    this database is still open, whatever its task. With limits, it may start
+    next to running attempts, inside the limits and without a write overlap. An
+    attempt left open by a crash keeps blocking until a person closes it with
+    `fail`, so an uncertain run is never retried automatically. Manual claims are
+    not limited."""
+    runner_pid = os.getpid() if cli is not None else None
+    runner_start = process_start(runner_pid) if cli is not None else None
     with transaction(conn):
         failed = [r[0] for r in conn.execute("SELECT id FROM tasks WHERE status = 'failed' ORDER BY position")]
         if failed:
             raise Blocked(f"failed task(s) {failed}: inspect, fix, then `retry --task ID`")
-        if cli is not None:
-            open_cli = [(r["id"], r["task_id"]) for r in conn.execute(
-                "SELECT id, task_id FROM attempts WHERE cli IS NOT NULL AND ended_at IS NULL ORDER BY id")]
-            if open_cli:
-                raise Blocked(f"open CLI attempt(s) {open_cli} (attempt, task): one CLI run per database at a time;"
-                              " if that run is gone, inspect its work, then `fail --attempt ID`")
+        open_cli = conn.execute(OPEN_CLI_SQL).fetchall() if cli is not None else []
+        if open_cli and limits is None:
+            shown = [(a["id"], a["task_id"]) for a in open_cli]
+            raise Blocked(f"open CLI attempt(s) {shown} (attempt, task): one CLI run per database at a time;"
+                          " if that run is gone, inspect its work, then `fail --attempt ID`")
+        if limits is not None:
+            check_parallel_limits(open_cli, cli, limits)
         ready = ready_tasks(conn)
         if task_id is not None:
             ready = [r for r in ready if r["id"] == task_id]
@@ -241,11 +331,19 @@ def claim(conn, worker, cli=None, task_id=None, select=None):
             ready = [r for r in ready if select(r)]
         if not ready:
             return None, None
+        if limits is not None and open_cli:
+            free = [r for r in ready if not any(
+                writes_overlap(stored_writes(r["writes"]), stored_writes(a["writes"])) for a in open_cli)]
+            if not free:
+                raise Busy(f"ready task(s) {[r['id'] for r in ready]} may write what running task(s)"
+                           f" {[a['task_id'] for a in open_cli]} write")
+            ready = free
         task = ready[0]
         conn.execute("UPDATE tasks SET status = 'claimed' WHERE id = ?", (task["id"],))
         cur = conn.execute(
-            "INSERT INTO attempts (task_id, worker, cli, started_at) VALUES (?, ?, ?, ?)",
-            (task["id"], worker, cli, now()),
+            "INSERT INTO attempts (task_id, worker, cli, runner_pid, runner_start, started_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (task["id"], worker, cli, runner_pid, runner_start, now()),
         )
         add_event(conn, "claim", task["id"], cur.lastrowid, f"worker={worker}")
         return task, cur.lastrowid
@@ -333,9 +431,22 @@ def load_cli(config_path: str, name: str) -> dict:
     if report_dir is not None and (not isinstance(report_dir, str) or not report_dir):
         raise WbsError("'report_dir' must be a non-empty string when given")
     return {"argv": argv, "timeout": timeout, "roles": roles,
+            "limits": parallel_limits(cfg, entry, name),
             "warning_dir": Path(config_path).resolve().parent / warning_dir,
             # Relative to the project (the working directory of `run`), so the CLI may write there.
             "report_dir": Path(report_dir).resolve() if report_dir else None}
+
+
+def parallel_limits(cfg, entry, name):
+    """{'total': n, 'cli': n}, or None when the config sets neither key: one CLI attempt at a time."""
+    if "max_parallel" not in cfg and "max_parallel" not in entry:
+        return None
+    total, own = cfg.get("max_parallel", 1), entry.get("max_parallel", 1)
+    if type(total) is not int or total < 1:
+        raise WbsError("max_parallel must be a positive integer")
+    if type(own) is not int or not 1 <= own <= MAX_PARALLEL_PER_CLI:
+        raise WbsError(f"cli {name!r}: max_parallel must be an integer from 1 to {MAX_PARALLEL_PER_CLI}")
+    return {"total": total, "cli": own}
 
 
 def flag_values(argv, flag_pattern) -> list:
@@ -396,6 +507,11 @@ def build_prompt(conn, task, report=None) -> str:
         "- Do not print, store or send secrets or personal data.",
         "- Work only on this task. Report what you changed and how you verified it.",
     ]
+    writes = stored_writes(task["writes"])
+    if writes is not None:
+        lines.append("- Other tasks may be working in this folder at the same time. "
+                     + (f"Change only these project paths: {', '.join(writes)}." if writes
+                        else "Do not change any project file."))
     if report is not None:
         lines += [
             f"- Before you exit, write your report to the file named on the next line. Its first line must be"
@@ -437,6 +553,31 @@ if os.name == "nt":
     _kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
     _kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
     _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, wintypes.LPDWORD)
+    _kernel32.GetProcessTimes.argtypes = (wintypes.HANDLE, *[wintypes.LPFILETIME] * 4)
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _STILL_ACTIVE = 259
+
+    def process_start(pid):
+        """A value that identifies a living process across pid reuse, or None if it cannot be read.
+
+        Not os.kill(pid, 0): on Windows that ends the process. An ended process can
+        still be opened while another handle to it exists, so the exit code is checked."""
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            code = wintypes.DWORD()
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if (not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != _STILL_ACTIVE
+                    or not _kernel32.GetProcessTimes(handle, *map(ctypes.byref, times))):
+                return None
+            return f"{times[0].dwHighDateTime}:{times[0].dwLowDateTime}"
+        finally:
+            _kernel32.CloseHandle(handle)
 
     def _job_for(proc):
         """A job that ends every process in it when its last handle closes, with proc assigned to it."""
@@ -452,6 +593,12 @@ if os.name == "nt":
             _kernel32.CloseHandle(job)
             return None
         return job
+else:
+    def process_start(pid):
+        """A value that identifies a living process across pid reuse, or None if it cannot be read."""
+        result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                                capture_output=True, encoding="utf-8", check=False)
+        return result.stdout.strip() or None
 
 
 class ProcessTree:
@@ -551,9 +698,10 @@ def cmd_init(args) -> int:
         conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", meta.items())
         conn.executemany(
             "INSERT INTO tasks (id, position, title, role, description, acceptance,"
-            " requires_approval, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+            " requires_approval, writes, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
             [(t["id"], pos, t["title"], t["role"], t["description"], t["acceptance"],
-              int(t["requires_approval"])) for pos, t in enumerate(tasks)],
+              int(t["requires_approval"]), None if t["writes"] is None else json.dumps(t["writes"]))
+             for pos, t in enumerate(tasks)],
         )
         conn.executemany(
             "INSERT INTO deps (task_id, depends_on) VALUES (?, ?)",
@@ -574,6 +722,10 @@ def cmd_status(conn, args) -> int:
         "counts": dict(Counter(t["status"] for t in tasks)),
         "cli_invocations": sum(t["cli_calls"] for t in tasks),
         "ready": [r["id"] for r in ready_tasks(conn)],
+        "open_attempts": [
+            {"attempt": a["id"], "task": a["task_id"], "worker": a["worker"], "cli": a["cli"],
+             "started_at": a["started_at"], "running": attempt_running(a) if a["cli"] is not None else None}
+            for a in conn.execute("SELECT * FROM attempts WHERE ended_at IS NULL ORDER BY id")],
         "tasks": tasks,
     })
     return EXIT_OK
@@ -629,7 +781,7 @@ def cmd_retry(conn, args) -> int:
 
 def cmd_run(conn, args) -> int:
     cli = load_cli(args.config, args.cli)
-    task, attempt = claim(conn, f"cli:{args.cli}", cli=args.cli,
+    task, attempt = claim(conn, f"cli:{args.cli}", cli=args.cli, limits=cli["limits"],
                           select=lambda r: r["role"] in cli["roles"] and not r["requires_approval"])
     if task is None:
         ready = [r["id"] for r in ready_tasks(conn)]
@@ -709,7 +861,13 @@ def main(argv=None) -> int:
         if not Path(args.db).is_file():
             raise WbsError("database not found; run init first")
         with closing(connect(args.db)) as conn:
+            if not any(column["name"] == "runner_pid" for column in conn.execute("PRAGMA table_info(attempts)")):
+                raise WbsError("database was created by an older wbs.py; finish it with that version"
+                               " or create a new database with init")
             return args.func(conn, args)
+    except Busy as exc:
+        emit({"result": "busy", "reason": str(exc), "cli_invoked": False})
+        return EXIT_OK
     except Blocked as exc:
         emit({"result": "blocked", "reason": str(exc), "cli_invoked": False})
         return EXIT_BLOCKED

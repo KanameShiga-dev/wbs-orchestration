@@ -225,6 +225,239 @@ class SingleCliRunTest(WbsTestCase):
         self.assertEqual(len(self.calls()), 1)
 
 
+class ParallelTestCase(WbsTestCase):
+    def parallel_config(self, total=2, a=1, b=1):
+        config = {
+            "warning_dir": str(self.warn_dir),
+            "max_parallel": total,
+            "clis": {"cli-a": {"argv": [sys.executable, str(self.fake_cli)], "max_parallel": a},
+                     "cli-b": {"argv": [sys.executable, str(self.fake_cli)], "max_parallel": b}},
+            "roles": {"implement": "cli-a", "review": "cli-b"},
+        }
+        path = self.dir / "config.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return str(path)
+
+    def start_run(self, config, mode="wait", cli="cli-a"):
+        argv, env = self.run_args(config, mode, cli)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", env=env)
+        self.addCleanup(self.end_run, proc)
+        return proc
+
+    def end_run(self, proc):
+        self.release.touch()
+        if proc.poll() is None:
+            proc.communicate(timeout=120)
+        for stream in (proc.stdout, proc.stderr):
+            stream.close()
+
+    def wait_for_calls(self, count):
+        deadline = time.monotonic() + 60
+        while len(self.calls()) < count:
+            self.assertLess(time.monotonic(), deadline, "the CLI did not start")
+            time.sleep(0.05)
+
+    def finish_runs(self, *procs):
+        self.release.touch()
+        return [json.loads(proc.communicate(timeout=120)[0]) for proc in procs]
+
+
+class ParallelRunTest(ParallelTestCase):
+    def test_free_cli_starts_while_another_cli_works(self):
+        self.init([task("A", writes=["a"]), task("B", role="review", writes=["b"])])
+        config = self.parallel_config()
+        first = self.start_run(config, cli="cli-a")
+        self.wait_for_calls(1)
+        second = self.start_run(config, cli="cli-b")
+        self.wait_for_calls(2)
+        status = self.cli("status")[1]
+        self.assertEqual([(o["task"], o["cli"], o["running"]) for o in status["open_attempts"]],
+                         [("A", "cli-a", True), ("B", "cli-b", True)])
+        outs = self.finish_runs(first, second)
+        self.assertEqual([(o["result"], o["task"]) for o in outs], [("awaiting_review", "A"), ("awaiting_review", "B")])
+        self.assertEqual(self.cli("status")[1]["open_attempts"], [])
+
+    def test_same_cli_waits_as_busy_at_its_limit(self):
+        self.init([task("A", writes=["a"]), task("B", writes=["b"])])
+        config = self.parallel_config(a=1)
+        first = self.start_run(config)
+        self.wait_for_calls(1)
+        proc = self.run_cli(config)
+        out = json.loads(proc.stdout)
+        self.assertEqual((proc.returncode, out["result"], out["cli_invoked"]), (wbs.EXIT_OK, "busy", False))
+        self.assertIn("limit of cli 'cli-a' reached (1 of 1)", out["reason"])
+        self.assertEqual(len(self.calls()), 1)
+        self.finish_runs(first)
+
+    def test_database_limit_also_makes_a_run_wait(self):
+        self.init([task("A", writes=["a"]), task("B", role="review", writes=["b"])])
+        config = self.parallel_config(total=1)
+        first = self.start_run(config)
+        self.wait_for_calls(1)
+        out = json.loads(self.run_cli(config, cli="cli-b").stdout)
+        self.assertEqual(out["result"], "busy")
+        self.assertIn("database limit reached (1 of 1)", out["reason"])
+        self.finish_runs(first)
+
+    def test_simultaneous_runs_of_one_cli_take_different_tasks(self):
+        self.init([task(f"T{i}", writes=[f"f{i}"]) for i in range(5)])
+        config = self.parallel_config(total=3, a=3)
+        procs = [self.start_run(config) for _ in range(3)]
+        self.wait_for_calls(3)
+        outs = self.finish_runs(*procs)
+        self.assertEqual(sorted(o["task"] for o in outs), ["T0", "T1", "T2"])
+        self.assertEqual(self.cli("status")[1]["counts"], {"awaiting_review": 3, "pending": 2})
+
+    def test_failure_stops_new_runs_but_a_running_cli_finishes(self):
+        self.init([task("A", writes=["a"]), task("B", role="review", writes=["b"]), task("C", writes=["c"])])
+        config = self.parallel_config()
+        first = self.start_run(config)
+        self.wait_for_calls(1)
+        self.assertEqual(self.run_cli(config, mode="fail", cli="cli-b").returncode, wbs.EXIT_BLOCKED)
+        proc = self.run_cli(config, cli="cli-b")
+        self.assertEqual((proc.returncode, json.loads(proc.stdout)["result"]), (wbs.EXIT_BLOCKED, "blocked"))
+        (out,) = self.finish_runs(first)
+        self.assertEqual((out["task"], out["result"]), ("A", "awaiting_review"))
+        counts = self.cli("status")[1]["counts"]
+        self.assertEqual(counts, {"awaiting_review": 1, "failed": 1, "pending": 1})
+
+    def test_killed_run_is_reported_for_a_person_and_not_counted_as_busy(self):
+        self.init([task("A", writes=["a"]), task("B", writes=["b"])])
+        config = self.parallel_config(a=2)
+        first = self.start_run(config)
+        self.wait_for_calls(1)
+        first.kill()
+        first.wait()
+        proc = self.run_cli(config)
+        out = json.loads(proc.stdout)
+        self.assertEqual((proc.returncode, out["result"], out["cli_invoked"]), (wbs.EXIT_BLOCKED, "blocked", False))
+        self.assertIn("no longer running", out["reason"])
+        self.assertEqual(self.cli("status")[1]["open_attempts"][0]["running"], False)
+        self.assertEqual(self.cli("fail", "--attempt", "1", "--reason", "Fictional crash")[0], wbs.EXIT_OK)
+        self.assertEqual(self.cli("retry", "--task", "A")[0], wbs.EXIT_OK)
+        self.assertEqual(json.loads(self.run_cli(config).stdout)["result"], "awaiting_review")
+
+    def test_reused_process_id_is_not_taken_for_the_run(self):
+        self.init([task("A", writes=["a"]), task("B", writes=["b"])])
+        with contextlib.closing(wbs.connect(self.db)) as conn:
+            _, attempt = wbs.claim(conn, "cli:cli-a", cli="cli-a")
+            self.assertEqual(self.cli("status")[1]["open_attempts"][0]["running"], True)
+            conn.execute("UPDATE attempts SET runner_start = 'another process' WHERE id = ?", (attempt,))
+        out = json.loads(self.run_cli(self.parallel_config(a=2)).stdout)
+        self.assertEqual(out["result"], "blocked")
+
+    def test_task_counts_and_warnings_stay_right_when_runs_overlap(self):
+        self.init([task("A", writes=["a"]), task("B", role="review", writes=["b"])])
+        config = self.parallel_config()
+        for round_no in range(1, 6):
+            procs = [self.start_run(config, mode="ok", cli=cli) for cli in ("cli-a", "cli-b")]
+            outs = {o["task"]: o for o in self.finish_runs(*procs)}
+            self.assertEqual({t: o["task_cli_calls"] for t, o in outs.items()}, {"A": round_no, "B": round_no})
+            if round_no < 5:
+                self.assertEqual(list(self.warn_dir.glob("*")), [])
+                self.reject_and_retry("A")
+                self.reject_and_retry("B")
+        self.assertEqual(len(list(self.warn_dir.glob("*"))), 2)
+        self.assertEqual(self.cli("status")[1]["cli_invocations"], 10)
+
+    def test_approval_tasks_and_review_gate_are_unchanged(self):
+        self.init([task("A", requires_approval=True), task("B", writes=[])])
+        config = self.parallel_config()
+        out = json.loads(self.run_cli(config).stdout)
+        self.assertEqual((out["task"], out["result"]), ("B", "awaiting_review"))
+        self.assertEqual(self.cli("complete", "--attempt", str(out["attempt"]))[0], wbs.EXIT_ERROR)
+        out = json.loads(self.run_cli(config).stdout)
+        self.assertEqual((out["result"], out["cli_invoked"]), ("idle", False))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_invalid_limits_are_config_errors_and_start_no_cli(self):
+        self.init([task("A")])
+        for total, own in ((2, 4), (2, 0), (2, True), (2, "2"), (0, 1), (True, 1)):
+            config = self.parallel_config(total=total, a=own)
+            with self.subTest(total=total, own=own):
+                self.assertEqual(self.run_cli(config).returncode, wbs.EXIT_ERROR)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.cli("status")[1]["counts"], {"pending": 1})
+
+    def test_older_database_is_refused_with_a_clear_error(self):
+        self.init([task("A")])
+        with contextlib.closing(wbs.connect(self.db)) as conn:
+            conn.execute("ALTER TABLE attempts DROP COLUMN runner_pid")
+        proc = self.run_cli(self.parallel_config())
+        self.assertEqual(proc.returncode, wbs.EXIT_ERROR)
+        self.assertIn("older wbs.py", proc.stderr)
+
+
+class WritesTest(ParallelTestCase):
+    def test_overlap_rules(self):
+        cases = (
+            (None, [], True), ([], None, True), (None, None, True), ([], [], False), ([], ["a"], False),
+            (["src/a.py"], ["src/b.py"], False), (["src/a.py"], ["SRC/A.PY"], True), (["src"], ["src/a.py"], True),
+            (["src/*.py"], ["src/a.py"], True), (["src/*.py"], ["docs/a.md"], False), (["*.py"], ["docs/a.md"], True),
+            (["src/a*/b.py"], ["src/c/d.py"], True), (["docs/**"], ["src/a.py"], False),
+        )
+        for first, second, expected in cases:
+            with self.subTest(first=first, second=second):
+                self.assertEqual(wbs.writes_overlap(first, second), expected)
+
+    def test_plan_rejects_invalid_writes_and_normalizes_slashes(self):
+        for writes in ("src", [""], [1], ["/etc/x"], ["C:/x"], ["C:\\x"], ["../x"], ["a/../../x"], ["\\\\host\\x"]):
+            with self.subTest(writes=writes), self.assertRaises(wbs.WbsError):
+                wbs.validate_plan({"plan": {"name": "Fictional plan"}, "tasks": [task("A", writes=writes)]})
+        _, tasks = wbs.validate_plan({"plan": {"name": "Fictional plan"}, "tasks": [task("A", writes=["src\\a.py"])]})
+        self.assertEqual(tasks[0]["writes"], ["src/a.py"])
+
+    def test_overlapping_task_waits_and_the_next_free_task_starts(self):
+        self.init([task("A", writes=["src"]), task("B", writes=["src/b.py"]), task("C", writes=["docs"])])
+        config = self.parallel_config(a=2)
+        first = self.start_run(config)
+        self.wait_for_calls(1)
+        second = self.start_run(config)
+        self.wait_for_calls(2)
+        proc = self.run_cli(self.parallel_config(total=3, a=3))
+        out = json.loads(proc.stdout)
+        self.assertEqual((proc.returncode, out["result"]), (wbs.EXIT_OK, "busy"))
+        self.assertIn("['B']", out["reason"])
+        self.assertEqual([o["task"] for o in self.finish_runs(first, second)], ["A", "C"])
+
+    def test_task_without_writes_runs_alone_in_both_directions(self):
+        for tasks in ([task("A"), task("B", writes=["b"])], [task("A", writes=["a"]), task("B")]):
+            with self.subTest(tasks=tasks):
+                Path(self.db).unlink(missing_ok=True)
+                self.record.unlink(missing_ok=True)
+                self.release.unlink(missing_ok=True)
+                self.init(tasks)
+                config = self.parallel_config(a=2)
+                first = self.start_run(config)
+                self.wait_for_calls(1)
+                self.assertEqual(json.loads(self.run_cli(config).stdout)["result"], "busy")
+                self.assertEqual(len(self.calls()), 1)
+                self.finish_runs(first)
+
+    def test_empty_writes_runs_next_to_other_tasks_and_the_prompt_says_so(self):
+        self.init([task("A", writes=["src"]), task("B", role="review", writes=[])])
+        config = self.parallel_config()
+        first = self.start_run(config)
+        self.wait_for_calls(1)
+        second = self.start_run(config, cli="cli-b")
+        self.wait_for_calls(2)
+        self.finish_runs(first, second)
+        prompts = [call["prompt"] for call in self.calls()]
+        self.assertIn("Change only these project paths: src.", prompts[0])
+        self.assertIn("Do not change any project file.", prompts[1])
+
+    def test_writes_are_ignored_without_parallel_limits(self):
+        self.init([task("A", writes=["a"]), task("B", writes=["b"])])
+        config = self.write_config()
+        argv, env = self.run_args(config, mode="wait")
+        first = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", env=env)
+        self.addCleanup(self.end_run, first)
+        self.wait_for_calls(1)
+        proc = self.run_cli(config)
+        self.assertEqual((proc.returncode, json.loads(proc.stdout)["result"]), (wbs.EXIT_BLOCKED, "blocked"))
+        self.finish_runs(first)
+
+
 class NoWorkTest(WbsTestCase):
     def test_nothing_ready_or_all_done_never_starts_the_cli(self):
         self.init([task("A"), task("B", deps=["A"])])
