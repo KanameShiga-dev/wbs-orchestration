@@ -67,6 +67,8 @@ CREATE TABLE attempts (
     cli_started INTEGER NOT NULL DEFAULT 0,
     runner_pid INTEGER,
     runner_start TEXT,
+    parallelism INTEGER,
+    profile_args TEXT,
     started_at TEXT NOT NULL,
     ended_at TEXT,
     outcome TEXT CHECK (outcome IN ('awaiting_review', 'done', 'failed')),
@@ -274,8 +276,14 @@ def writes_overlap(first, second) -> bool:
     return False
 
 
-def stored_writes(value):
+def stored_json(value):
     return None if value is None else json.loads(value)
+
+
+def profile_args_for(profiles, parallelism) -> list:
+    """Arguments of the profile for this parallelism, or of the nearest lower one; none if there is none."""
+    usable = [int(key) for key in profiles if int(key) <= parallelism]
+    return profiles[str(max(usable))]["args"] if usable else []
 
 
 def attempt_running(attempt) -> bool:
@@ -300,7 +308,7 @@ def check_parallel_limits(open_cli, cli, limits) -> None:
                    f" open attempts (attempt, task, cli): {running}")
 
 
-def claim(conn, worker, cli=None, task_id=None, select=None, limits=None):
+def claim(conn, worker, cli=None, task_id=None, select=None, limits=None, profiles=None):
     """Atomically claim one ready task. Returns (task_row, attempt_id) or (None, None).
 
     A CLI claim (cli is set) with no limits is refused while any CLI attempt in
@@ -308,7 +316,8 @@ def claim(conn, worker, cli=None, task_id=None, select=None, limits=None):
     next to running attempts, inside the limits and without a write overlap. An
     attempt left open by a crash keeps blocking until a person closes it with
     `fail`, so an uncertain run is never retried automatically. Manual claims are
-    not limited."""
+    not limited. A CLI attempt records its parallelism (open attempts of this CLI,
+    including itself) and the profile arguments that go with it."""
     runner_pid = os.getpid() if cli is not None else None
     runner_start = process_start(runner_pid) if cli is not None else None
     with transaction(conn):
@@ -333,17 +342,21 @@ def claim(conn, worker, cli=None, task_id=None, select=None, limits=None):
             return None, None
         if limits is not None and open_cli:
             free = [r for r in ready if not any(
-                writes_overlap(stored_writes(r["writes"]), stored_writes(a["writes"])) for a in open_cli)]
+                writes_overlap(stored_json(r["writes"]), stored_json(a["writes"])) for a in open_cli)]
             if not free:
                 raise Busy(f"ready task(s) {[r['id'] for r in ready]} may write what running task(s)"
                            f" {[a['task_id'] for a in open_cli]} write")
             ready = free
         task = ready[0]
+        parallelism, profile_args = None, None
+        if cli is not None:
+            parallelism = sum(a["cli"] == cli for a in open_cli) + 1
+            profile_args = json.dumps(profile_args_for(profiles or {}, parallelism))
         conn.execute("UPDATE tasks SET status = 'claimed' WHERE id = ?", (task["id"],))
         cur = conn.execute(
-            "INSERT INTO attempts (task_id, worker, cli, runner_pid, runner_start, started_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (task["id"], worker, cli, runner_pid, runner_start, now()),
+            "INSERT INTO attempts (task_id, worker, cli, runner_pid, runner_start, parallelism, profile_args,"
+            " started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (task["id"], worker, cli, runner_pid, runner_start, parallelism, profile_args, now()),
         )
         add_event(conn, "claim", task["id"], cur.lastrowid, f"worker={worker}")
         return task, cur.lastrowid
@@ -432,6 +445,7 @@ def load_cli(config_path: str, name: str) -> dict:
         raise WbsError("'report_dir' must be a non-empty string when given")
     return {"argv": argv, "timeout": timeout, "roles": roles,
             "limits": parallel_limits(cfg, entry, name),
+            "profiles": parallel_profiles(entry, argv, name),
             "warning_dir": Path(config_path).resolve().parent / warning_dir,
             # Relative to the project (the working directory of `run`), so the CLI may write there.
             "report_dir": Path(report_dir).resolve() if report_dir else None}
@@ -447,6 +461,25 @@ def parallel_limits(cfg, entry, name):
     if type(own) is not int or not 1 <= own <= MAX_PARALLEL_PER_CLI:
         raise WbsError(f"cli {name!r}: max_parallel must be an integer from 1 to {MAX_PARALLEL_PER_CLI}")
     return {"total": total, "cli": own}
+
+
+def parallel_profiles(entry, argv, name) -> dict:
+    """Validate parallel_profiles. Each profile is checked joined to argv, because the
+    permission checks depend on combinations such as an approval flag and a sandbox."""
+    profiles = entry.get("parallel_profiles", {})
+    if not isinstance(profiles, dict):
+        raise WbsError(f"cli {name!r}: parallel_profiles must be an object")
+    allowed_keys = {str(n) for n in range(1, MAX_PARALLEL_PER_CLI + 1)}
+    for key, profile in profiles.items():
+        if key not in allowed_keys:
+            raise WbsError(f"cli {name!r}: parallel_profiles key {key!r} must be one of {sorted(allowed_keys)}")
+        args = profile.get("args") if isinstance(profile, dict) and set(profile) == {"args"} else None
+        if not isinstance(args, list) or not args or not all(isinstance(a, str) and a for a in args):
+            raise WbsError(f"cli {name!r}: parallel_profiles[{key!r}] must be {{\"args\": [non-empty strings]}}")
+        bypass = bypass_arguments(argv + args)
+        if bypass:
+            raise WbsError(f"cli {name!r}: refusing permission-bypass arguments {bypass} with profile {key!r}")
+    return profiles
 
 
 def flag_values(argv, flag_pattern) -> list:
@@ -507,7 +540,7 @@ def build_prompt(conn, task, report=None) -> str:
         "- Do not print, store or send secrets or personal data.",
         "- Work only on this task. Report what you changed and how you verified it.",
     ]
-    writes = stored_writes(task["writes"])
+    writes = stored_json(task["writes"])
     if writes is not None:
         lines.append("- Other tasks may be working in this folder at the same time. "
                      + (f"Change only these project paths: {', '.join(writes)}." if writes
@@ -726,6 +759,10 @@ def cmd_status(conn, args) -> int:
             {"attempt": a["id"], "task": a["task_id"], "worker": a["worker"], "cli": a["cli"],
              "started_at": a["started_at"], "running": attempt_running(a) if a["cli"] is not None else None}
             for a in conn.execute("SELECT * FROM attempts WHERE ended_at IS NULL ORDER BY id")],
+        "cli_attempts": [
+            {"attempt": a["id"], "task": a["task_id"], "cli": a["cli"], "parallelism": a["parallelism"],
+             "profile_args": stored_json(a["profile_args"]), "outcome": a["outcome"]}
+            for a in conn.execute("SELECT * FROM attempts WHERE cli IS NOT NULL ORDER BY id")],
         "tasks": tasks,
     })
     return EXIT_OK
@@ -781,7 +818,7 @@ def cmd_retry(conn, args) -> int:
 
 def cmd_run(conn, args) -> int:
     cli = load_cli(args.config, args.cli)
-    task, attempt = claim(conn, f"cli:{args.cli}", cli=args.cli, limits=cli["limits"],
+    task, attempt = claim(conn, f"cli:{args.cli}", cli=args.cli, limits=cli["limits"], profiles=cli["profiles"],
                           select=lambda r: r["role"] in cli["roles"] and not r["requires_approval"])
     if task is None:
         ready = [r["id"] for r in ready_tasks(conn)]
@@ -792,7 +829,9 @@ def cmd_run(conn, args) -> int:
     if cli["report_dir"] is not None:
         cli["report_dir"].mkdir(parents=True, exist_ok=True)
         report = cli["report_dir"] / f"{task['id']}-attempt{attempt}.md"
-    started, exit_code, note = invoke(cli["argv"], build_prompt(conn, task, report), cli["timeout"],
+    recorded = conn.execute("SELECT parallelism, profile_args FROM attempts WHERE id = ?", (attempt,)).fetchone()
+    profile_args = stored_json(recorded["profile_args"])
+    started, exit_code, note = invoke(cli["argv"] + profile_args, build_prompt(conn, task, report), cli["timeout"],
                                       on_start=lambda: mark_started(conn, attempt))
     report_status = read_report_status(report) if report is not None and exit_code == 0 else None
     if report_status:
@@ -808,7 +847,8 @@ def cmd_run(conn, args) -> int:
         warning = write_warning(cli["warning_dir"], task["id"], calls, Path(args.db).name)
     emit({"result": outcome, "task": task["id"], "attempt": attempt, "exit_code": exit_code,
           "cli_invoked": started, "task_cli_calls": calls, "warning_file": warning,
-          "report": report_status, "report_file": str(report) if report is not None else None})
+          "report": report_status, "report_file": str(report) if report is not None else None,
+          "parallelism": recorded["parallelism"], "profile_args": profile_args})
     return EXIT_OK if outcome == "awaiting_review" else EXIT_BLOCKED
 
 
@@ -861,7 +901,7 @@ def main(argv=None) -> int:
         if not Path(args.db).is_file():
             raise WbsError("database not found; run init first")
         with closing(connect(args.db)) as conn:
-            if not any(column["name"] == "runner_pid" for column in conn.execute("PRAGMA table_info(attempts)")):
+            if not any(column["name"] == "profile_args" for column in conn.execute("PRAGMA table_info(attempts)")):
                 raise WbsError("database was created by an older wbs.py; finish it with that version"
                                " or create a new database with init")
             return args.func(conn, args)

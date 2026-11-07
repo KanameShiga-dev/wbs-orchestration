@@ -123,6 +123,9 @@ Config rules, checked by `run`. Only the CLI entry named by `--cli` is checked:
   configuration.
 - `max_parallel`, when given at the top level, must be a positive integer.
   `clis.NAME.max_parallel`, when given, must be an integer from 1 to 3.
+- `clis.NAME.parallel_profiles`, when given, has the keys `"1"` to `"3"`, each
+  with exactly `{"args": [non-empty strings]}`. Each profile joined to `argv`
+  must pass the same bypass checks as `argv`.
 
 On Windows, a CLI installed as a `.cmd` launcher (common for npm packages) is
 not found by its bare name, because only `.exe` is appended when searching.
@@ -191,7 +194,7 @@ Errors print one line, `error: ...`, to stderr and no JSON.
 | Command | Effect |
 |---|---|
 | `init --plan FILE` | Create the database from a plan. Fails if the database file already exists |
-| `status` | Plan name, counts per state, ready ids, total CLI starts (`cli_invocations`), open attempts (`open_attempts`: attempt, task, worker, cli, start time, and `running`, which is `null` for manual attempts), and each task with its own `cli_calls` |
+| `status` | Plan name, counts per state, ready ids, total CLI starts (`cli_invocations`), open attempts (`open_attempts`: attempt, task, worker, cli, start time, and `running`, which is `null` for manual attempts), every CLI attempt (`cli_attempts`: attempt, task, cli, `parallelism`, `profile_args`, outcome), and each task with its own `cli_calls` |
 | `ready` | Ready tasks with id, title, role and `requires_approval` |
 | `claim --worker NAME [--task ID]` | Claim the first ready task, or the given ready task, for a person or agent. No role filter. Prints the attempt id |
 | `complete --attempt N [--note TEXT]` | Mark a non-CLI attempt `done`. Refused for attempts started by `run` |
@@ -250,8 +253,9 @@ In this order:
    - `no ready task; awaiting review: [...]`
    - `all tasks done`
    - `no ready task`
-4. Starts the CLI once, from `argv`, without a shell, and writes the prompt to
-   stdin as UTF-8. stdout and stderr go to the null device. CLI output is
+4. Starts the CLI once, from `argv` plus any profile arguments (see "Model and
+   effort per parallelism"), without a shell, and writes the prompt to stdin as
+   UTF-8. stdout and stderr go to the null device. CLI output is
    discarded, and is never printed or stored. There is no automatic retry.
    Every process the CLI starts is ended when the call ends, on timeout and
    also after a normal exit. On Windows the CLI joins a Job Object that ends
@@ -280,7 +284,8 @@ In this order:
    warning file is written after the outcome is saved, and `wbs.py` does not
    catch errors from writing it.
 7. Prints `result`, `task`, `attempt`, `exit_code`, `cli_invoked`,
-   `task_cli_calls`, `warning_file`, `report` and `report_file`.
+   `task_cli_calls`, `warning_file`, `report`, `report_file`, `parallelism` and
+   `profile_args`.
 
 The prompt contains the plan name and goal, the task id, title and role, the
 ids of the completed prerequisites, the description, the acceptance criteria,
@@ -461,6 +466,42 @@ change with `writes`. Manual `claim` attempts are not compared with it. Attempts
 that have ended are not compared either, so changes awaiting review may sit next
 to a new run. Use separate worktrees yourself if a task needs stronger isolation.
 
+### Model and effort per parallelism
+
+Running one CLI several times at once uses its tokens and quota that much
+faster. `parallel_profiles` lets each extra attempt use a lighter setting:
+
+```json
+{
+  "clis": {
+    "builder": {
+      "argv": ["<builder-cli-executable>"],
+      "max_parallel": 3,
+      "parallel_profiles": {
+        "1": {"args": ["<flag for the main model>", "<flag for high effort>"]},
+        "2": {"args": ["<flag for a lighter model>", "<flag for medium effort>"]},
+        "3": {"args": ["<flag for a lighter model>", "<flag for low effort>"]}
+      }
+    }
+  }
+}
+```
+
+- Parallelism is the number of open attempts of this CLI when the attempt starts,
+  including itself. It is counted in the same transaction as the claim.
+- The arguments of the matching profile go after `argv`. With no matching
+  profile, the nearest lower one is used. With no lower one, only `argv` is used.
+  So check that the CLI accepts flags after the last item of `argv`.
+- A running CLI keeps the arguments it started with, even when the count changes.
+- `wbs.py` does not interpret the arguments, because flags differ by CLI and
+  version. Take them from the installed CLI's help and try them on a fictional
+  plan. A wrong flag usually fails the CLI call, which stops scheduling.
+- Each attempt records its parallelism and arguments, and `run` and `status` show
+  them, so a reviewer can see what produced the work. Keep secrets out of these
+  arguments, like everything else in the config.
+- Profiles also work without `max_parallel`: every attempt then uses profile `"1"`.
+  Attempts of other CLIs do not count, so set this per CLI.
+
 ## HTML status report
 
 `scripts/render_wbs.py` writes one self-contained HTML page from a database.
@@ -561,6 +602,9 @@ They cover:
   refused.
 - `writes`: validation, overlap rules, a free task chosen over an overlapping
   one, tasks without `writes` running alone, and `[]` running next to others.
+- `parallel_profiles`: the arguments a stand-in CLI receives at each
+  parallelism, the fallback to a lower profile or `argv` alone, invalid or
+  bypassing profiles, and the record shown by `status`.
 - The review gate: exit code 0 needs `accept`, `complete` is refused, and
   `reject` blocks until `retry`.
 - `render_wbs.py`: escaped titles and plan name, every task row in plan

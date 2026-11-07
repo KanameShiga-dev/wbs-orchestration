@@ -226,11 +226,11 @@ class SingleCliRunTest(WbsTestCase):
 
 
 class ParallelTestCase(WbsTestCase):
-    def parallel_config(self, total=2, a=1, b=1):
+    def parallel_config(self, total=2, a=1, b=1, extra_argv=(), **cli_a):
         config = {
             "warning_dir": str(self.warn_dir),
             "max_parallel": total,
-            "clis": {"cli-a": {"argv": [sys.executable, str(self.fake_cli)], "max_parallel": a},
+            "clis": {"cli-a": {"argv": [sys.executable, str(self.fake_cli), *extra_argv], "max_parallel": a, **cli_a},
                      "cli-b": {"argv": [sys.executable, str(self.fake_cli)], "max_parallel": b}},
             "roles": {"implement": "cli-a", "review": "cli-b"},
         }
@@ -382,7 +382,7 @@ class ParallelRunTest(ParallelTestCase):
     def test_older_database_is_refused_with_a_clear_error(self):
         self.init([task("A")])
         with contextlib.closing(wbs.connect(self.db)) as conn:
-            conn.execute("ALTER TABLE attempts DROP COLUMN runner_pid")
+            conn.execute("ALTER TABLE attempts DROP COLUMN profile_args")
         proc = self.run_cli(self.parallel_config())
         self.assertEqual(proc.returncode, wbs.EXIT_ERROR)
         self.assertIn("older wbs.py", proc.stderr)
@@ -456,6 +456,75 @@ class WritesTest(ParallelTestCase):
         proc = self.run_cli(config)
         self.assertEqual((proc.returncode, json.loads(proc.stdout)["result"]), (wbs.EXIT_BLOCKED, "blocked"))
         self.finish_runs(first)
+
+
+class ParallelProfileTest(ParallelTestCase):
+    PROFILES = {"1": {"args": ["--level", "one"]}, "2": {"args": ["--level", "two"]}, "3": {"args": ["--level", "three"]}}
+
+    def start_in_turn(self, config, count):
+        """Start runs one after another, so each one's parallelism is certain."""
+        procs = []
+        for number in range(1, count + 1):
+            procs.append(self.start_run(config))
+            self.wait_for_calls(number)
+        return procs
+
+    def test_each_parallelism_starts_with_its_own_arguments(self):
+        self.init([task(f"T{i}", writes=[f"f{i}"]) for i in range(4)])
+        config = self.parallel_config(total=3, a=3, parallel_profiles=self.PROFILES)
+        outs = self.finish_runs(*self.start_in_turn(config, 3))
+        self.assertEqual([call["argv"] for call in self.calls()],
+                         [["--level", "one"], ["--level", "two"], ["--level", "three"]])
+        self.assertEqual([(o["parallelism"], o["profile_args"]) for o in outs],
+                         [(1, ["--level", "one"]), (2, ["--level", "two"]), (3, ["--level", "three"])])
+        # Once the others have ended, the next run counts from one again.
+        out = json.loads(self.run_cli(config).stdout)
+        self.assertEqual((out["parallelism"], out["profile_args"]), (1, ["--level", "one"]))
+
+    def test_missing_profile_uses_the_nearest_lower_one_or_argv_alone(self):
+        self.init([task(f"T{i}", writes=[f"f{i}"]) for i in range(3)])
+        profiles = {"2": {"args": ["--level", "two"]}}
+        config = self.parallel_config(total=3, a=3, parallel_profiles=profiles)
+        self.finish_runs(*self.start_in_turn(config, 3))
+        self.assertEqual([call["argv"] for call in self.calls()], [[], ["--level", "two"], ["--level", "two"]])
+
+    def test_profile_one_applies_without_parallel_limits(self):
+        self.init([task("A")])
+        config = self.write_config(parallel_profiles=self.PROFILES)
+        out = json.loads(self.run_cli(config).stdout)
+        self.assertEqual(out["parallelism"], 1)
+        self.assertEqual(self.calls()[0]["argv"], ["--level", "one"])
+
+    def test_invalid_or_bypassing_profiles_are_config_errors_and_start_no_cli(self):
+        self.init([task("A")])
+        confined = ["--sandbox", "workspace-write", "-a", "never"]
+        cases = (
+            ((), {"1": {"args": ["--dangerously-skip-permissions"]}}),
+            ((), {"3": {"args": ["--permission-mode", "auto"]}}),
+            ((), {"2": {"args": ["-a", "never"]}}),
+            (("--ask-for-approval",), {"1": {"args": ["never"]}}),
+            (confined, {"1": {"args": ["--sandbox", "other"]}}),
+            ((), {"0": {"args": ["x"]}}), ((), {"4": {"args": ["x"]}}), ((), {"high": {"args": ["x"]}}),
+            ((), {"1": {"args": ["x"], "model": "x"}}), ((), {"1": ["x"]}), ((), {"1": {"args": []}}),
+            ((), {"1": {"args": [""]}}), ((), {"1": {"args": "x"}}), ((), ["x"]),
+        )
+        for extra_argv, profiles in cases:
+            with self.subTest(argv=extra_argv, profiles=profiles):
+                config = self.parallel_config(extra_argv=extra_argv, parallel_profiles=profiles)
+                self.assertEqual(self.run_cli(config).returncode, wbs.EXIT_ERROR)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.cli("status")[1]["counts"], {"pending": 1})
+        allowed = self.parallel_config(extra_argv=confined, parallel_profiles={"1": {"args": ["--level", "one"]}})
+        self.assertTrue(wbs.load_cli(allowed, "cli-a")["profiles"])
+
+    def test_status_shows_parallelism_and_arguments_of_each_attempt(self):
+        self.init([task("A", writes=["a"]), task("B", writes=["b"])])
+        config = self.parallel_config(a=2, parallel_profiles=self.PROFILES)
+        self.finish_runs(*self.start_in_turn(config, 2))
+        attempts = self.cli("status")[1]["cli_attempts"]
+        self.assertEqual([(a["task"], a["cli"], a["parallelism"], a["profile_args"], a["outcome"]) for a in attempts],
+                         [("A", "cli-a", 1, ["--level", "one"], "awaiting_review"),
+                          ("B", "cli-a", 2, ["--level", "two"], "awaiting_review")])
 
 
 class NoWorkTest(WbsTestCase):
