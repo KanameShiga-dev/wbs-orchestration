@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "wbs.py"
 sys.path.insert(0, str(SCRIPT.parent))
@@ -19,12 +20,35 @@ SECRET = "fictional-secret-value-123"
 
 # Stand-in for a real agent CLI: records what it received, then exits.
 FAKE_CLI = """
-import json, os, re, subprocess, sys, time
+import glob, json, os, re, subprocess, sys, time
 HEARTBEAT = "import sys, time\\nend = time.time() + 60\\nwhile time.time() < end:\\n    open(sys.argv[1], 'a').write('.')\\n    time.sleep(0.1)\\n"
 prompt = sys.stdin.read()
-with open(os.environ["FAKE_CLI_RECORD"], "a", encoding="utf-8") as f:
-    f.write(json.dumps({"argv": sys.argv[1:], "prompt": prompt}) + "\\n")
+# One file per call: simultaneous appends to one file can lose a line on Windows.
+call_file = f"{os.environ['FAKE_CLI_RECORD']}.{time.time_ns():020d}.{os.getpid()}"
+with open(call_file + ".tmp", "w", encoding="utf-8") as f:
+    f.write(json.dumps({"argv": sys.argv[1:], "prompt": prompt}))
+os.replace(call_file + ".tmp", call_file + ".json")
+review = re.search(r"^Verdict file: (.+)$", prompt, re.M)
+if review:
+    verdict = os.environ.get("FAKE_VERDICT", "accept")
+    if verdict == "exit-1":
+        sys.exit(1)
+    if verdict == "change":
+        with open("changed-by-reviewer.txt", "w", encoding="utf-8") as f:
+            f.write("Fictional change")
+        verdict = "accept"
+    if verdict != "none":
+        with open(review.group(1), "w", encoding="utf-8") as f:
+            f.write(("looks fine" if verdict == "garbage" else "VERDICT: " + verdict) + "\\nFictional reason\\n")
+    sys.exit(0)
 mode = os.environ.get("FAKE_CLI_MODE", "ok")
+if mode == "both":
+    # Exits only if a second CLI starts while this one is still running.
+    deadline = time.time() + 20
+    while len(glob.glob(os.environ["FAKE_CLI_RECORD"] + ".*.json")) < 2 and time.time() < deadline:
+        time.sleep(0.05)
+    if time.time() >= deadline:
+        sys.exit(1)
 if mode == "leak":
     print("leaked " + os.environ["FAKE_SECRET"])
     print("leaked " + os.environ["FAKE_SECRET"], file=sys.stderr)
@@ -105,10 +129,11 @@ class WbsTestCase(unittest.TestCase):
         argv, env = self.run_args(config, mode, cli)
         return subprocess.run(argv, capture_output=True, encoding="utf-8", env=env, timeout=120, check=False)
 
+    def call_files(self):
+        return sorted(self.dir.glob(self.record.name + ".*.json"))
+
     def calls(self):
-        if not self.record.exists():
-            return []
-        return [json.loads(line) for line in self.record.read_text(encoding="utf-8").splitlines()]
+        return [json.loads(path.read_text(encoding="utf-8")) for path in self.call_files()]
 
     def reject_and_retry(self, tid):
         """A reviewer rejects the task, then a person explicitly returns it to pending."""
@@ -382,7 +407,7 @@ class ParallelRunTest(ParallelTestCase):
     def test_older_database_is_refused_with_a_clear_error(self):
         self.init([task("A")])
         with contextlib.closing(wbs.connect(self.db)) as conn:
-            conn.execute("ALTER TABLE attempts DROP COLUMN profile_args")
+            conn.execute("ALTER TABLE tasks DROP COLUMN checkpoint")
         proc = self.run_cli(self.parallel_config())
         self.assertEqual(proc.returncode, wbs.EXIT_ERROR)
         self.assertIn("older wbs.py", proc.stderr)
@@ -424,7 +449,8 @@ class WritesTest(ParallelTestCase):
         for tasks in ([task("A"), task("B", writes=["b"])], [task("A", writes=["a"]), task("B")]):
             with self.subTest(tasks=tasks):
                 Path(self.db).unlink(missing_ok=True)
-                self.record.unlink(missing_ok=True)
+                for path in self.call_files():
+                    path.unlink()
                 self.release.unlink(missing_ok=True)
                 self.init(tasks)
                 config = self.parallel_config(a=2)
@@ -525,6 +551,228 @@ class ParallelProfileTest(ParallelTestCase):
         self.assertEqual([(a["task"], a["cli"], a["parallelism"], a["profile_args"], a["outcome"]) for a in attempts],
                          [("A", "cli-a", 1, ["--level", "one"], "awaiting_review"),
                           ("B", "cli-a", 2, ["--level", "two"], "awaiting_review")])
+
+
+class AdvanceTest(WbsTestCase):
+    def setUp(self):
+        super().setUp()
+        self.project = self.dir / "project"
+        self.project.mkdir()
+
+    def advance_config(self, mode="auto", reviewers=None, report_dir=".wbs-reports", argv_b=(), **progress):
+        fake = [sys.executable, str(self.fake_cli)]
+        config = {
+            "warning_dir": str(self.warn_dir),
+            "clis": {"cli-a": {"argv": fake}, "cli-b": {"argv": fake + list(argv_b)}},
+            "roles": {"implement": "cli-a", "review": "cli-b"},
+        }
+        if mode is not None:
+            config["progress"] = {"mode": mode, "reviewers": reviewers or {"cli-a": "cli-b", "cli-b": "cli-a"},
+                                  **progress}
+        if report_dir is not None:
+            config["report_dir"] = report_dir
+        path = self.dir / "config.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return str(path)
+
+    def parallel_config(self, **extra):
+        path = self.advance_config()
+        config = json.loads(Path(path).read_text(encoding="utf-8"))
+        config.update(max_parallel=2, **extra)
+        Path(path).write_text(json.dumps(config), encoding="utf-8")
+        return path
+
+    def advance(self, config, verdict="accept", mode="ok", max_steps=50):
+        env = dict(os.environ, FAKE_CLI_RECORD=str(self.record), FAKE_CLI_MODE=mode, FAKE_VERDICT=verdict,
+                   FAKE_SECRET=SECRET)
+        return subprocess.run([sys.executable, str(SCRIPT), "--db", self.db, "advance", "--config", config,
+                               "--max-steps", str(max_steps)], capture_output=True, encoding="utf-8", env=env,
+                              cwd=self.project, timeout=120, check=False)
+
+    def assert_stop(self, proc, code, stop):
+        self.assertEqual(proc.returncode, code, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["stop"], stop, out["reason"])
+        return out
+
+    def states(self):
+        return {t["id"]: t["status"] for t in self.cli("status")[1]["tasks"]}
+
+    def events(self, kind):
+        with contextlib.closing(wbs.connect(self.db)) as conn:
+            return [r["detail"] for r in conn.execute("SELECT detail FROM events WHERE kind = ? ORDER BY id", (kind,))]
+
+    def test_without_a_mode_advance_is_a_config_error_and_run_still_works(self):
+        self.init([task("A")])
+        for config in (self.advance_config(mode=None), self.advance_config(mode="manual")):
+            self.assertEqual(self.advance(config).returncode, wbs.EXIT_ERROR)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(json.loads(self.run_cli(config).stdout)["result"], "awaiting_review")
+        self.assertEqual(self.states(), {"A": "awaiting_review"})  # nobody accepted it
+
+    def test_auto_repeats_run_and_review_up_to_an_approval_task(self):
+        self.init([task("A"), task("B", deps=["A"], role="review"), task("C", deps=["B"], requires_approval=True)])
+        out = self.assert_stop(self.advance(self.advance_config()), wbs.EXIT_OK, "person_needed")
+        self.assertEqual(self.states(), {"A": "done", "B": "done", "C": "pending"})
+        self.assertEqual(out["auto_accepted"], [{"task": "A", "reviewer": "cli-b-auto"},
+                                                {"task": "B", "reviewer": "cli-a-auto"}])
+        self.assertEqual(out["steps"], 4)
+        self.assertEqual(len(self.calls()), 4)
+        self.assertTrue(any("reviewer=cli-b-auto" in d for d in self.events("accept")))
+        self.assertEqual(self.events("advance_stop"), ["stop=person_needed; auto_accepted=2; steps=4"])
+        verdict_files = list((self.project / ".wbs-reports").glob("*-review*.md"))
+        self.assertEqual(len(verdict_files), 2)
+        self.assertNotIn(b"Fictional reason", Path(self.db).read_bytes())
+
+    def test_all_done_is_a_normal_stop(self):
+        self.init([task("A")])
+        self.assert_stop(self.advance(self.advance_config()), wbs.EXIT_OK, "done")
+
+    def test_each_kind_of_checkpoint_stops_and_leaves_the_task_to_a_person(self):
+        cases = (
+            ({"checkpoints": {"tasks": ["B"]}}, {}, "implement"),
+            ({"checkpoints": {"roles": ["special"]}}, {}, "special"),
+            ({}, {"checkpoint": True}, "implement"),
+        )
+        for progress, flags, role in cases:
+            with self.subTest(progress=progress, flags=flags):
+                Path(self.db).unlink(missing_ok=True)
+                self.init([task("A"), task("B", deps=["A"], role=role, **flags), task("C", deps=["B"])])
+                config = self.advance_config(mode="checkpoint", **(progress or {"checkpoints": {"every": 99}}))
+                raw = json.loads(Path(config).read_text(encoding="utf-8"))
+                raw["roles"]["special"] = "cli-a"
+                Path(config).write_text(json.dumps(raw), encoding="utf-8")
+                self.assert_stop(self.advance(config), wbs.EXIT_OK, "checkpoint")
+                self.assertEqual(self.states(), {"A": "done", "B": "awaiting_review", "C": "pending"})
+                self.assertFalse(any("task B" in d for d in self.events("accept")))
+                self.assert_stop(self.advance(config), wbs.EXIT_OK, "checkpoint")  # still waiting
+                self.assertEqual(self.cli("accept", "--task", "B", "--reviewer", "person")[0], wbs.EXIT_OK)
+                self.assert_stop(self.advance(config), wbs.EXIT_OK, "done")
+                self.assertEqual(self.states(), {"A": "done", "B": "done", "C": "done"})
+
+    def test_every_n_stops_and_a_new_advance_continues(self):
+        self.init([task("A"), task("B", deps=["A"]), task("C", deps=["B"]), task("D", deps=["C"])])
+        config = self.advance_config(mode="checkpoint", checkpoints={"every": 2})
+        out = self.assert_stop(self.advance(config), wbs.EXIT_OK, "every")
+        self.assertEqual(len(out["auto_accepted"]), 2)
+        self.assertEqual(self.states(), {"A": "done", "B": "done", "C": "pending", "D": "pending"})
+        self.assert_stop(self.advance(config), wbs.EXIT_OK, "every")
+        self.assertEqual(set(self.states().values()), {"done"})
+
+    def test_unusable_review_stops_without_a_verdict(self):
+        cases = (("change", "review_changed_files"), ("none", "review_undecided"), ("garbage", "review_undecided"),
+                 ("needs-human", "review_undecided"), ("exit-1", "review_failed"))
+        for verdict, stop in cases:
+            with self.subTest(verdict=verdict):
+                Path(self.db).unlink(missing_ok=True)
+                self.init([task("A")])
+                out = self.assert_stop(self.advance(self.advance_config(), verdict=verdict), wbs.EXIT_BLOCKED, stop)
+                self.assertEqual(out["auto_accepted"], [])
+                self.assertEqual(self.states(), {"A": "awaiting_review"})
+                self.assertEqual(self.events("accept") + self.events("reject"), [])
+                (self.project / "changed-by-reviewer.txt").unlink(missing_ok=True)
+
+    def test_verdict_left_by_an_earlier_plan_is_not_used(self):
+        self.init([task("A")])
+        stale = self.project / ".wbs-reports" / "A-attempt1-review1.md"
+        stale.parent.mkdir()
+        stale.write_text("VERDICT: accept\n", encoding="utf-8")
+        self.assert_stop(self.advance(self.advance_config(), verdict="none"), wbs.EXIT_BLOCKED, "review_undecided")
+        self.assertEqual(self.states(), {"A": "awaiting_review"})
+
+    def test_ignored_folder_does_not_count_as_a_reviewer_change(self):
+        self.init([task("A")])
+        config = self.advance_config(ignore_dirs=["ignored"])
+        script = ("import os; os.makedirs('ignored', exist_ok=True); open('ignored/x', 'w').close()\n"
+                  + FAKE_CLI)
+        self.fake_cli.write_text(script, encoding="utf-8")
+        self.assert_stop(self.advance(config), wbs.EXIT_OK, "done")
+
+    def test_reject_stops_and_later_advance_is_blocked_until_retry(self):
+        self.init([task("A"), task("B", deps=["A"])])
+        config = self.advance_config()
+        self.assert_stop(self.advance(config, verdict="reject"), wbs.EXIT_BLOCKED, "rejected")
+        self.assertEqual(self.states(), {"A": "failed", "B": "pending"})
+        self.assertTrue(any("reviewer=cli-b-auto" in d for d in self.events("reject")))
+        self.assert_stop(self.advance(config), wbs.EXIT_BLOCKED, "blocked")
+        self.assertEqual(self.cli("retry", "--task", "A")[0], wbs.EXIT_OK)
+        self.assert_stop(self.advance(config), wbs.EXIT_OK, "done")
+
+    def test_failed_cli_and_call_warning_stop_with_code_three(self):
+        self.init([task("A")])
+        config = self.advance_config()
+        out = self.assert_stop(self.advance(config, mode="fail"), wbs.EXIT_BLOCKED, "failed")
+        self.assertEqual([s["result"] for s in out["started"]], ["failed"])
+        self.assertEqual(len(self.calls()), 1)  # no review of a failed task
+        for _ in range(3):
+            self.assertEqual(self.cli("retry", "--task", "A")[0], wbs.EXIT_OK)
+            self.assert_stop(self.advance(config, mode="fail"), wbs.EXIT_BLOCKED, "failed")
+        self.assertEqual(self.cli("retry", "--task", "A")[0], wbs.EXIT_OK)
+        self.assert_stop(self.advance(config), wbs.EXIT_BLOCKED, "call_warning")
+        self.assertEqual(self.states(), {"A": "awaiting_review"})
+
+    def test_cli_reporting_needs_approval_stops(self):
+        self.init([task("A")])
+        out = self.assert_stop(self.advance(self.advance_config(), mode="report-needs-approval"),
+                               wbs.EXIT_BLOCKED, "failed")
+        self.assertEqual(out["started"][0]["report"], "needs-approval")
+
+    def test_max_steps_stops_between_steps(self):
+        self.init([task("A"), task("B", deps=["A"])])
+        config = self.advance_config()
+        self.assert_stop(self.advance(config, max_steps=1), wbs.EXIT_OK, "max_steps")
+        self.assertEqual(self.states(), {"A": "awaiting_review", "B": "pending"})
+        self.assert_stop(self.advance(config, max_steps=1), wbs.EXIT_OK, "max_steps")
+        self.assertEqual(self.states(), {"A": "done", "B": "pending"})
+        self.assertEqual(self.advance(config, max_steps=0).returncode, wbs.EXIT_ERROR)
+
+    def test_interrupted_attempt_stops_advance(self):
+        self.init([task("A"), task("B")])
+        with contextlib.closing(wbs.connect(self.db)) as conn:
+            wbs.claim(conn, "cli:cli-a", cli="cli-a")
+        self.assert_stop(self.advance(self.advance_config()), wbs.EXIT_BLOCKED, "blocked")
+
+    def test_free_clis_run_at_the_same_time_within_the_limits(self):
+        self.init([task("A", writes=["a"]), task("B", role="review", writes=["b"])])
+        out = self.assert_stop(self.advance(self.parallel_config(), mode="both"), wbs.EXIT_OK, "done")
+        self.assertEqual(sorted(a["task"] for a in out["auto_accepted"]), ["A", "B"])
+
+    def test_invalid_progress_is_a_config_error_and_starts_no_cli(self):
+        self.init([task("A")])
+        cases = (
+            {"reviewers": {"cli-a": "cli-a", "cli-b": "cli-a"}},
+            {"reviewers": {"cli-a": "cli-b"}},
+            {"reviewers": {"cli-a": "missing", "cli-b": "cli-a"}},
+            {"mode": "checkpoint"},
+            {"mode": "checkpoint", "checkpoints": {"tasks": ["Z"]}},
+            {"mode": "checkpoint", "checkpoints": {"roles": ["z"]}},
+            {"mode": "checkpoint", "checkpoints": {"every": 0}},
+            {"mode": "checkpoint", "checkpoints": {"other": 1}},
+            {"checkpoints": {"every": 1}},
+            {"ignore_dirs": "x"},
+            {"other": 1},
+            {"argv_b": ["--dangerously-skip-permissions"]},
+            {"report_dir": None},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertEqual(self.advance(self.advance_config(**case)).returncode, wbs.EXIT_ERROR)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.states(), {"A": "pending"})
+
+    def test_role_mapped_to_something_other_than_a_name_is_a_config_error(self):
+        self.init([task("A")])
+        config = self.advance_config()
+        raw = json.loads(Path(config).read_text(encoding="utf-8"))
+        raw["roles"]["implement"] = ["cli-a"]
+        Path(config).write_text(json.dumps(raw), encoding="utf-8")
+        proc = self.advance(config)
+        self.assertEqual(proc.returncode, wbs.EXIT_ERROR)
+        self.assertIn("error: each value in 'roles'", proc.stderr)
+
+    def test_plan_rejects_a_checkpoint_that_is_not_a_boolean(self):
+        with self.assertRaises(wbs.WbsError):
+            wbs.validate_plan({"plan": {"name": "Fictional plan"}, "tasks": [task("A", checkpoint="yes")]})
 
 
 class NoWorkTest(WbsTestCase):
@@ -659,6 +907,41 @@ class ReportTest(WbsTestCase):
         out = json.loads(self.run_cli(self.write_config(report_dir=str(self.dir / "reports"))).stdout)
         self.assertEqual((out["result"], out["report"]), ("awaiting_review", "missing"))
         self.assertIn("Report file: ", self.calls()[0]["prompt"])
+
+
+class ReportFileDetailsTest(WbsTestCase):
+    def test_report_left_by_an_earlier_plan_is_not_used(self):
+        self.init([task("A")])
+        reports = self.dir / "reports"
+        reports.mkdir()
+        (reports / "A-attempt1.md").write_text("STATUS: needs-approval\n", encoding="utf-8")
+        out = json.loads(self.run_cli(self.write_config(report_dir=str(reports))).stdout)
+        self.assertEqual((out["result"], out["report"]), ("awaiting_review", "missing"))
+
+    def test_status_lines_with_a_byte_order_mark_are_read(self):
+        path = self.dir / "file.md"
+        for text, pattern, expected in (("STATUS: done\n", wbs.REPORT_STATUS, "done"),
+                                        ("VERDICT: accept\n", wbs.REVIEW_VERDICT, "accept")):
+            path.write_text(text, encoding="utf-8-sig")
+            self.assertEqual(wbs.read_status_line(path, pattern), expected)
+
+    def test_report_file_is_allowed_next_to_writes(self):
+        self.init([task("A", writes=[])])
+        self.run_cli(self.write_config(report_dir=str(self.dir / "reports")))
+        self.assertIn("Do not change any project file. The report file named below is allowed.",
+                      self.calls()[0]["prompt"])
+
+
+class PosixProcessStartTest(unittest.TestCase):
+    def test_missing_ps_means_unknown_instead_of_a_crash(self):
+        with mock.patch.object(wbs.subprocess, "run", side_effect=FileNotFoundError("ps")):
+            self.assertIsNone(wbs.posix_process_start(1))
+
+    def test_output_of_ps_identifies_the_process(self):
+        for stdout, expected in (("Mon Jan  1 00:00:00 2026\n", "Mon Jan  1 00:00:00 2026"), ("", None)):
+            result = subprocess.CompletedProcess([], 0, stdout=stdout)
+            with mock.patch.object(wbs.subprocess, "run", return_value=result):
+                self.assertEqual(wbs.posix_process_start(1), expected)
 
 
 class FailureTest(WbsTestCase):

@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import closing, contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -23,7 +24,8 @@ NOTE_MAX = 500
 EXIT_OK, EXIT_ERROR, EXIT_BLOCKED = 0, 1, 3
 MAX_PARALLEL_PER_CLI = 3
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-TASK_KEYS = {"id", "title", "role", "description", "acceptance", "depends_on", "requires_approval", "writes"}
+TASK_KEYS = {"id", "title", "role", "description", "acceptance", "depends_on", "requires_approval", "writes",
+             "checkpoint"}
 WILDCARDS = set("*?[")
 # A guard against obvious permission bypass, not a guarantee: review every configured argv.
 # "danger" also covers values such as "danger-full-access", not only "--dangerously-...".
@@ -40,6 +42,7 @@ CONFINED_SANDBOXES = {"read-only", "workspace-write"}
 # A script as argv[0] can add flags that this check never sees.
 WRAPPER_SUFFIXES = (".cmd", ".bat", ".ps1", ".sh", ".vbs")
 REPORT_STATUS = re.compile(r"^STATUS:\s*(done|needs-approval|blocked)\s*$", re.IGNORECASE)
+REVIEW_VERDICT = re.compile(r"^VERDICT:\s*(accept|reject|needs-human)\s*$", re.IGNORECASE)
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -52,6 +55,7 @@ CREATE TABLE tasks (
     acceptance TEXT NOT NULL,
     requires_approval INTEGER NOT NULL,
     writes TEXT,
+    checkpoint INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'awaiting_review', 'done', 'failed'))
 );
 CREATE TABLE deps (
@@ -187,14 +191,15 @@ def validate_plan(data):
         deps = raw.get("depends_on", [])
         if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps) or len(set(deps)) != len(deps):
             raise WbsError(f"task {tid}: depends_on must be a list of unique task ids")
-        approval = raw.get("requires_approval", False)
-        if not isinstance(approval, bool):
-            raise WbsError(f"task {tid}: requires_approval must be true or false")
+        approval, checkpoint = raw.get("requires_approval", False), raw.get("checkpoint", False)
+        if not isinstance(approval, bool) or not isinstance(checkpoint, bool):
+            raise WbsError(f"task {tid}: requires_approval and checkpoint must be true or false")
         texts = {key: raw.get(key, "") for key in ("description", "acceptance")}
         if not all(isinstance(v, str) for v in texts.values()):
             raise WbsError(f"task {tid}: description and acceptance must be strings")
         tasks.append({"id": tid, "title": title.strip(), "role": role, "depends_on": deps,
-                      "requires_approval": approval, "writes": validate_writes(tid, raw), **texts})
+                      "requires_approval": approval, "checkpoint": checkpoint,
+                      "writes": validate_writes(tid, raw), **texts})
     check_graph(tasks)
     return {"name": plan["name"].strip(), "goal": goal.strip()}, tasks
 
@@ -414,11 +419,15 @@ def review(conn, task_id, reviewer, verdict, note):
 # ---- CLI dispatch ----------------------------------------------------------
 
 
-def load_cli(config_path: str, name: str) -> dict:
-    """Validate the config and return the settings of the one CLI named on this run."""
+def load_config(config_path: str) -> dict:
     cfg = load_json(config_path)
     if not isinstance(cfg, dict) or not isinstance(cfg.get("clis"), dict) or not isinstance(cfg.get("roles"), dict):
         raise WbsError("config needs 'clis' and 'roles' objects")
+    return cfg
+
+
+def check_entry(cfg: dict, name: str) -> dict:
+    """Validate one CLI entry, for a worker or a reviewer, and return how to start it."""
     entry = cfg["clis"].get(name)
     if not isinstance(entry, dict):
         raise WbsError(f"cli {name!r} is not in the config; only configured CLIs can run")
@@ -434,6 +443,13 @@ def load_cli(config_path: str, name: str) -> dict:
     timeout = entry.get("timeout_seconds", 1800)
     if not isinstance(timeout, int) or timeout <= 0:
         raise WbsError(f"cli {name!r}: timeout_seconds must be a positive integer")
+    return {"argv": argv, "timeout": timeout, "profiles": parallel_profiles(entry, argv, name)}
+
+
+def load_cli(config_path: str, name: str) -> dict:
+    """Validate the config and return the settings of the one CLI named on this run."""
+    cfg = load_config(config_path)
+    settings = check_entry(cfg, name)
     roles = {role for role, assigned in cfg["roles"].items() if assigned == name}
     if not roles:
         raise WbsError(f"cli {name!r}: no role is assigned to it in 'roles'")
@@ -443,9 +459,8 @@ def load_cli(config_path: str, name: str) -> dict:
     report_dir = cfg.get("report_dir")
     if report_dir is not None and (not isinstance(report_dir, str) or not report_dir):
         raise WbsError("'report_dir' must be a non-empty string when given")
-    return {"argv": argv, "timeout": timeout, "roles": roles,
-            "limits": parallel_limits(cfg, entry, name),
-            "profiles": parallel_profiles(entry, argv, name),
+    return {**settings, "roles": roles,
+            "limits": parallel_limits(cfg, cfg["clis"][name], name),
             "warning_dir": Path(config_path).resolve().parent / warning_dir,
             # Relative to the project (the working directory of `run`), so the CLI may write there.
             "report_dir": Path(report_dir).resolve() if report_dir else None}
@@ -482,6 +497,55 @@ def parallel_profiles(entry, argv, name) -> dict:
     return profiles
 
 
+def load_progress(config_path: str, conn) -> tuple:
+    """Validate the config of `advance`. Returns (worker CLIs, reviewer names, reviewer CLIs, progress)."""
+    cfg = load_config(config_path)
+    progress = cfg.get("progress", {})
+    mode = progress.get("mode", "manual") if isinstance(progress, dict) else None
+    if mode not in ("checkpoint", "auto"):
+        raise WbsError("advance needs progress.mode set to 'checkpoint' or 'auto' in the config")
+    if unknown := set(progress) - {"mode", "reviewers", "checkpoints", "ignore_dirs"}:
+        raise WbsError(f"progress has unknown keys: {sorted(unknown)}")
+    if not all(isinstance(name, str) for name in cfg["roles"].values()):
+        raise WbsError("each value in 'roles' must be a CLI name")
+    clis = {name: load_cli(config_path, name) for name in dict.fromkeys(cfg["roles"].values())}
+    if not clis:
+        raise WbsError("advance needs at least one role mapped to a CLI")
+    if any(cli["report_dir"] is None for cli in clis.values()):
+        raise WbsError("advance needs 'report_dir': the reviewer writes its verdict there")
+    reviewers = progress.get("reviewers")
+    if not isinstance(reviewers, dict) or not all(isinstance(r, str) for r in reviewers.values()):
+        raise WbsError("progress.reviewers must map each worker CLI to a reviewer CLI")
+    for name in clis:
+        reviewer = reviewers.get(name)
+        if not isinstance(reviewer, str) or reviewer == name:
+            raise WbsError(f"progress.reviewers: cli {name!r} needs a reviewer that is a different CLI")
+    ignore_dirs = progress.get("ignore_dirs", [])
+    if not isinstance(ignore_dirs, list) or not all(isinstance(d, str) and d for d in ignore_dirs):
+        raise WbsError("progress.ignore_dirs must be a list of folder names")
+    return (clis, reviewers, {name: check_entry(cfg, name) for name in set(reviewers.values())},
+            {"mode": mode, "ignore_dirs": set(ignore_dirs), **load_checkpoints(progress, mode, conn)})
+
+
+def load_checkpoints(progress, mode, conn) -> dict:
+    """Validate the checkpoints. A wrong name would silently hand a person's review to an agent, so it is an error."""
+    points = progress.get("checkpoints", {})
+    if mode == "auto" and points:
+        raise WbsError("progress.checkpoints needs mode 'checkpoint'; mode 'auto' has none")
+    if not isinstance(points, dict) or set(points) - {"tasks", "roles", "every"}:
+        raise WbsError("progress.checkpoints may only have 'tasks', 'roles' and 'every'")
+    tasks, roles, every = points.get("tasks", []), points.get("roles", []), points.get("every")
+    rows = conn.execute("SELECT id, role, checkpoint FROM tasks").fetchall()
+    for label, names, known in (("tasks", tasks, {r["id"] for r in rows}), ("roles", roles, {r["role"] for r in rows})):
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names) or set(names) - known:
+            raise WbsError(f"progress.checkpoints.{label} must list names from the plan")
+    if every is not None and (type(every) is not int or every < 1):
+        raise WbsError("progress.checkpoints.every must be a positive integer")
+    if mode == "checkpoint" and not (tasks or roles or every or any(r["checkpoint"] for r in rows)):
+        raise WbsError("mode 'checkpoint' needs at least one checkpoint in the config or the plan")
+    return {"tasks": set(tasks), "roles": set(roles), "every": every}
+
+
 def flag_values(argv, flag_pattern) -> list:
     """(argument as written, lower-case value) for each use of a flag, as --flag=value or --flag value."""
     found = []
@@ -505,14 +569,15 @@ def bypass_arguments(argv) -> list:
     return found
 
 
-def read_report_status(path: Path) -> str:
-    """Read only the first line of the CLI's report; the rest stays in the project for the reviewer."""
+def read_status_line(path: Path, pattern) -> str:
+    """Read only the first line of a report or verdict; the rest stays in the project for the reviewer."""
     try:
-        with open(path, encoding="utf-8") as f:
+        # utf-8-sig: Windows tools often start a text file with a byte order mark.
+        with open(path, encoding="utf-8-sig") as f:
             first = f.readline(200)
     except (OSError, UnicodeDecodeError):
         return "missing"
-    match = REPORT_STATUS.match(first.strip())
+    match = pattern.match(first.strip())
     return match.group(1).lower() if match else "unrecognized"
 
 
@@ -544,7 +609,8 @@ def build_prompt(conn, task, report=None) -> str:
     if writes is not None:
         lines.append("- Other tasks may be working in this folder at the same time. "
                      + (f"Change only these project paths: {', '.join(writes)}." if writes
-                        else "Do not change any project file."))
+                        else "Do not change any project file.")
+                     + (" The report file named below is allowed." if report is not None else ""))
     if report is not None:
         lines += [
             f"- Before you exit, write your report to the file named on the next line. Its first line must be"
@@ -553,6 +619,45 @@ def build_prompt(conn, task, report=None) -> str:
             "- If an action needs user approval, do not do it: write STATUS: needs-approval with the reason, then exit.",
         ]
     return "\n".join(lines) + "\n"
+
+
+def build_review_prompt(conn, task, worker_report: Path, verdict_file: Path) -> str:
+    plan = conn.execute("SELECT value FROM meta WHERE key = 'name'").fetchone()[0]
+    return "\n".join([
+        "You review exactly one finished task from a work breakdown structure.",
+        f"Plan: {plan}",
+        f"Task {task['id']}: {task['title']}",
+        "",
+        "Description:",
+        task["description"] or "(none)",
+        "",
+        "Acceptance criteria:",
+        task["acceptance"] or "(none)",
+        "",
+        "Rules:",
+        "- Follow the AGENTS.md and other instructions of the project you work in.",
+        "- Judge the changes in the project against the acceptance criteria.",
+        f"- The worker's own report, if it wrote one, is at {worker_report}. It is a claim, not evidence.",
+        "- Do not change, create or delete any project file except the verdict file. Any other change voids the review.",
+        "- Do not bypass permission or approval prompts. Do not print, store or send secrets or personal data.",
+        "- Before you exit, write the verdict file. Its first line must be exactly one of:"
+        " VERDICT: accept / VERDICT: reject / VERDICT: needs-human. Give your reasons below that line.",
+        "- If you are unsure, or a person should decide, write VERDICT: needs-human.",
+        f"Verdict file: {verdict_file}",
+    ]) + "\n"
+
+
+def posix_process_start(pid):
+    """A value that identifies a living process across pid reuse, or None if it cannot be read.
+
+    Minimal systems may have no `ps`. Default runs must still work there, so this is
+    "unknown", which parallel runs treat as not running."""
+    try:
+        result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                                capture_output=True, encoding="utf-8", check=False)
+    except OSError:
+        return None
+    return result.stdout.strip() or None
 
 
 if os.name == "nt":
@@ -627,11 +732,7 @@ if os.name == "nt":
             return None
         return job
 else:
-    def process_start(pid):
-        """A value that identifies a living process across pid reuse, or None if it cannot be read."""
-        result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                                capture_output=True, encoding="utf-8", check=False)
-        return result.stdout.strip() or None
+    process_start = posix_process_start
 
 
 class ProcessTree:
@@ -731,10 +832,10 @@ def cmd_init(args) -> int:
         conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", meta.items())
         conn.executemany(
             "INSERT INTO tasks (id, position, title, role, description, acceptance,"
-            " requires_approval, writes, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+            " requires_approval, writes, checkpoint, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
             [(t["id"], pos, t["title"], t["role"], t["description"], t["acceptance"],
-              int(t["requires_approval"]), None if t["writes"] is None else json.dumps(t["writes"]))
-             for pos, t in enumerate(tasks)],
+              int(t["requires_approval"]), None if t["writes"] is None else json.dumps(t["writes"]),
+              int(t["checkpoint"])) for pos, t in enumerate(tasks)],
         )
         conn.executemany(
             "INSERT INTO deps (task_id, depends_on) VALUES (?, ?)",
@@ -816,24 +917,37 @@ def cmd_retry(conn, args) -> int:
     return EXIT_OK
 
 
+def claim_for_cli(conn, name, cli):
+    return claim(conn, f"cli:{name}", cli=name, limits=cli["limits"], profiles=cli["profiles"],
+                 select=lambda r: r["role"] in cli["roles"] and not r["requires_approval"])
+
+
 def cmd_run(conn, args) -> int:
     cli = load_cli(args.config, args.cli)
-    task, attempt = claim(conn, f"cli:{args.cli}", cli=args.cli, limits=cli["limits"], profiles=cli["profiles"],
-                          select=lambda r: r["role"] in cli["roles"] and not r["requires_approval"])
+    task, attempt = claim_for_cli(conn, args.cli, cli)
     if task is None:
         ready = [r["id"] for r in ready_tasks(conn)]
         reason = f"ready tasks need user approval or another cli: {ready}" if ready else idle_reason(conn)
         emit({"result": "idle", "reason": reason, "cli_invoked": False})
         return EXIT_OK
+    out = execute_attempt(conn, task, attempt, cli, Path(args.db).name)
+    emit(out)
+    return EXIT_OK if out["result"] == "awaiting_review" else EXIT_BLOCKED
+
+
+def execute_attempt(conn, task, attempt, cli, db_name) -> dict:
+    """Start the CLI for a claimed attempt and record the outcome. Returns what `run` prints."""
     report = None
     if cli["report_dir"] is not None:
         cli["report_dir"].mkdir(parents=True, exist_ok=True)
         report = cli["report_dir"] / f"{task['id']}-attempt{attempt}.md"
+        # A new database restarts the numbering: a report left by an earlier plan must never count.
+        report.unlink(missing_ok=True)
     recorded = conn.execute("SELECT parallelism, profile_args FROM attempts WHERE id = ?", (attempt,)).fetchone()
     profile_args = stored_json(recorded["profile_args"])
     started, exit_code, note = invoke(cli["argv"] + profile_args, build_prompt(conn, task, report), cli["timeout"],
                                       on_start=lambda: mark_started(conn, attempt))
-    report_status = read_report_status(report) if report is not None and exit_code == 0 else None
+    report_status = read_status_line(report, REPORT_STATUS) if report is not None and exit_code == 0 else None
     if report_status:
         note += f"; report: {report_status}"
     # Exit code 0 only means the CLI says it finished; a reviewer decides with accept/reject.
@@ -844,12 +958,167 @@ def cmd_run(conn, args) -> int:
     calls = task_cli_calls(conn, task["id"])
     warning = None
     if started and calls % WARN_EVERY == 0:
-        warning = write_warning(cli["warning_dir"], task["id"], calls, Path(args.db).name)
-    emit({"result": outcome, "task": task["id"], "attempt": attempt, "exit_code": exit_code,
-          "cli_invoked": started, "task_cli_calls": calls, "warning_file": warning,
-          "report": report_status, "report_file": str(report) if report is not None else None,
-          "parallelism": recorded["parallelism"], "profile_args": profile_args})
-    return EXIT_OK if outcome == "awaiting_review" else EXIT_BLOCKED
+        warning = write_warning(cli["warning_dir"], task["id"], calls, db_name)
+    return {"result": outcome, "task": task["id"], "attempt": attempt, "exit_code": exit_code,
+            "cli_invoked": started, "task_cli_calls": calls, "warning_file": warning,
+            "report": report_status, "report_file": str(report) if report is not None else None,
+            "parallelism": recorded["parallelism"], "profile_args": profile_args}
+
+
+def execute_in_thread(db_path, task, attempt, cli) -> dict:
+    with closing(connect(db_path)) as conn:
+        return execute_attempt(conn, task, attempt, cli, Path(db_path).name)
+
+
+def awaiting_review(conn) -> list:
+    return conn.execute("SELECT * FROM tasks WHERE status = 'awaiting_review' ORDER BY position").fetchall()
+
+
+def needs_person(task, progress) -> bool:
+    return progress["mode"] == "checkpoint" and bool(
+        task["checkpoint"] or task["id"] in progress["tasks"] or task["role"] in progress["roles"])
+
+
+def project_snapshot(skip, ignore_dirs) -> dict:
+    """Size and modification time of each file under the working directory. Git would not see a
+    second change to a file the worker left uncommitted, so files are compared directly."""
+    root = Path.cwd().resolve()
+    found = {}
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d != ".git" and d not in ignore_dirs and Path(folder, d) not in skip]
+        for name in files:
+            path = Path(folder, name)
+            if path not in skip:
+                info = path.lstat()
+                found[str(path.relative_to(root))] = (info.st_size, info.st_mtime_ns)
+    return found
+
+
+def review_with_agent(conn, task, clis, reviewers, reviewer_clis, progress, db_path) -> tuple:
+    """Run the assigned reviewer once and apply its verdict. Returns (stop kind or None, detail, reviewer label)."""
+    attempt = conn.execute("SELECT id, cli FROM attempts WHERE task_id = ? AND cli IS NOT NULL"
+                           " ORDER BY id DESC LIMIT 1", (task["id"],)).fetchone()
+    reviewer = reviewers.get(attempt["cli"])
+    if reviewer is None or reviewer == attempt["cli"]:
+        raise WbsError(f"task {task['id']}: cli {attempt['cli']!r} has no reviewer in progress.reviewers")
+    entry = reviewer_clis[reviewer]
+    worker = clis.get(attempt["cli"], next(iter(clis.values())))
+    report_dir = worker["report_dir"]
+    report_dir.mkdir(parents=True, exist_ok=True)
+    earlier = conn.execute("SELECT COUNT(*) FROM events WHERE kind = 'agent_review' AND task_id = ?",
+                           (task["id"],)).fetchone()[0]
+    verdict_file = report_dir / f"{task['id']}-attempt{attempt['id']}-review{earlier + 1}.md"
+    # A new database restarts the numbering: a verdict left by an earlier plan must never count.
+    verdict_file.unlink(missing_ok=True)
+    db = Path(db_path).resolve()
+    skip = {report_dir, worker["warning_dir"].resolve(), db, *(Path(f"{db}{s}") for s in ("-journal", "-wal", "-shm"))}
+    before = project_snapshot(skip, progress["ignore_dirs"])
+    argv = entry["argv"] + profile_args_for(entry["profiles"], 1)
+    prompt = build_review_prompt(conn, task, report_dir / f"{task['id']}-attempt{attempt['id']}.md", verdict_file)
+    _, exit_code, note = invoke(argv, prompt, entry["timeout"], on_start=lambda: None)
+    after = project_snapshot(skip, progress["ignore_dirs"])
+    changed = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
+    verdict = read_status_line(verdict_file, REVIEW_VERDICT) if exit_code == 0 else None
+    label = f"{reviewer}-auto"
+    add_event(conn, "agent_review", task["id"], attempt["id"],
+              f"reviewer={label}; args={profile_args_for(entry['profiles'], 1)}; verdict={verdict}; "
+              f"changed_files={len(changed)}"[:NOTE_MAX])
+    if exit_code != 0:
+        return "review_failed", f"reviewer of task {task['id']} failed: {note}", label
+    if changed:
+        return ("review_changed_files", f"reviewer of task {task['id']} changed {len(changed)} file(s), for example"
+                f" {changed[:5]}; verdict not used", label)
+    if verdict not in ("accept", "reject"):
+        return "review_undecided", f"reviewer of task {task['id']} gave verdict {verdict!r}: a person must review", label
+    note = f"verdict file {verdict_file.name}"
+    review(conn, task["id"], label, verdict, note)
+    if verdict == "reject":
+        return "rejected", f"task {task['id']} rejected by {label}: see {verdict_file.name}", label
+    return None, "", label
+
+
+def cmd_advance(conn, args) -> int:
+    """Repeat dispatch and agent review until a checkpoint, an approval task or anything unusual."""
+    if args.max_steps < 1:
+        raise WbsError("--max-steps must be a positive integer")
+    clis, reviewers, reviewer_clis, progress = load_progress(args.config, conn)
+    steps, stops, started, accepted = 0, [], [], []
+
+    def stop(kind, reason, abnormal=False):
+        stops.append({"stop": kind, "reason": reason, "abnormal": abnormal})
+
+    workers = sum(cli["limits"]["cli"] if cli["limits"] else 1 for cli in clis.values())
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        running = {}
+        while True:
+            if not stops:
+                waiting = [t["id"] for t in awaiting_review(conn) if needs_person(t, progress)]
+                if waiting:
+                    stop("checkpoint", f"task(s) {waiting} wait for a person's review")
+            if not stops:
+                try:
+                    for name, cli in clis.items():
+                        # Without limits a claim is refused while any attempt is open, so one at a time.
+                        while steps < args.max_steps and not (cli["limits"] is None and running):
+                            try:
+                                task, attempt = claim_for_cli(conn, name, cli)
+                            except Busy:
+                                break
+                            if task is None:
+                                break
+                            running[pool.submit(execute_in_thread, args.db, task, attempt, cli)] = task["id"]
+                            steps += 1
+                except Blocked as exc:
+                    stop("blocked", str(exc), abnormal=True)
+            if running:
+                done, _ = wait(running, return_when=FIRST_COMPLETED)
+                for future in done:
+                    del running[future]
+                    out = future.result()
+                    started.append({key: out[key] for key in (
+                        "task", "attempt", "result", "exit_code", "report", "parallelism", "warning_file")})
+                    if out["result"] != "awaiting_review":
+                        stop("failed", f"task {out['task']} ended failed: inspect, fix, then `retry`", abnormal=True)
+                    elif out["warning_file"]:
+                        stop("call_warning", f"task {out['task']} reached {out['task_cli_calls']} CLI starts:"
+                             " check progress, cost and quota", abnormal=True)
+                continue
+            if stops:
+                break
+            # A review compares project files, so nothing else may be writing.
+            if conn.execute(OPEN_CLI_SQL).fetchone():
+                stop("other_run", "another run has an open CLI attempt; advance again when it has ended")
+                break
+            reviewable = awaiting_review(conn)
+            if reviewable:
+                if steps >= args.max_steps:
+                    stop("max_steps", f"reached --max-steps {args.max_steps}")
+                    break
+                steps += 1
+                kind, detail, label = review_with_agent(conn, reviewable[0], clis, reviewers, reviewer_clis,
+                                                        progress, args.db)
+                if kind:
+                    stop(kind, detail, abnormal=True)
+                else:
+                    accepted.append({"task": reviewable[0]["id"], "reviewer": label})
+                    if progress["every"] and len(accepted) % progress["every"] == 0:
+                        stop("every", f"{len(accepted)} task(s) accepted by agents: a person checks progress,"
+                             " then runs advance again")
+                continue
+            ready = ready_tasks(conn)
+            mapped = {role for cli in clis.values() for role in cli["roles"]}
+            if any(r["role"] in mapped and not r["requires_approval"] for r in ready):
+                stop("max_steps", f"reached --max-steps {args.max_steps}")
+            elif ready:
+                stop("person_needed", f"ready task(s) {[r['id'] for r in ready]} need a person")
+            else:
+                reason = idle_reason(conn)
+                stop("done" if reason == "all tasks done" else "idle", reason)
+            break
+    final = next((s for s in stops if s["abnormal"]), stops[0])
+    add_event(conn, "advance_stop", detail=f"stop={final['stop']}; auto_accepted={len(accepted)}; steps={steps}")
+    emit({"result": "stopped", **final, "steps": steps, "auto_accepted": accepted, "started": started})
+    return EXIT_BLOCKED if final["abnormal"] else EXIT_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -890,6 +1159,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True, help="JSON config with clis, roles and warning_dir")
     p.add_argument("--cli", required=True, help="the one configured CLI authorized for this run")
     p.set_defaults(func=cmd_run)
+    p = sub.add_parser("advance", help="repeat run and agent review, in checkpoint or auto mode, until a stop")
+    p.add_argument("--config", required=True, help="JSON config with progress.mode and progress.reviewers")
+    p.add_argument("--max-steps", type=int, required=True, help="most CLI starts, worker and reviewer together")
+    p.set_defaults(func=cmd_advance)
     return parser
 
 
@@ -901,7 +1174,7 @@ def main(argv=None) -> int:
         if not Path(args.db).is_file():
             raise WbsError("database not found; run init first")
         with closing(connect(args.db)) as conn:
-            if not any(column["name"] == "profile_args" for column in conn.execute("PRAGMA table_info(attempts)")):
+            if not any(column["name"] == "checkpoint" for column in conn.execute("PRAGMA table_info(tasks)")):
                 raise WbsError("database was created by an older wbs.py; finish it with that version"
                                " or create a new database with init")
             return args.func(conn, args)

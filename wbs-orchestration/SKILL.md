@@ -9,7 +9,8 @@ Split a change into a work breakdown structure (WBS) with dependencies, keep its
 state in SQLite with `scripts/wbs.py`, and dispatch at most one ready task per
 `run` to a CLI that the user configured and named on that command line. A CLI
 never moves a task to `done` by itself. A reviewer must run `accept` or `reject`
-on each CLI task.
+on each CLI task. Only when the user chooses a progress mode and agent reviewers
+in the config may `advance` record those verdicts (see "Progress modes").
 
 ## Scope
 
@@ -22,6 +23,8 @@ In scope:
 - Allowing one open CLI attempt per database by default, or several when the
   config sets limits (see "Running CLIs in parallel"). Manual claims are not
   limited by either.
+- Repeating dispatch and agent review until a checkpoint, an approval task or
+  anything unusual, when the user chose that mode in the config.
 
 Out of scope:
 - Installing CLIs or storing credentials. This package is a skill,
@@ -96,7 +99,7 @@ Each project has its own files. Agree on their locations with the user:
 |---|---|---|
 | Plan JSON | Plan name, goal, tasks | Format in `examples/plan.example.json` |
 | State database | SQLite file given with `--db` | Created by `init`. `init` never overwrites an existing database |
-| Config JSON | `clis`, `roles`, `warning_dir`, optional `report_dir` and `max_parallel` | Format in `examples/config.example.json` |
+| Config JSON | `clis`, `roles`, `warning_dir`, optional `report_dir`, `max_parallel` and `progress` | Format in `examples/config.example.json` |
 | Warning folder | Warning files from `run` | `warning_dir` in the config. A relative path resolves from the config file's folder |
 | Report folder | Report files the CLI writes | `report_dir` in the config. A relative path resolves from the working directory of `run`, so it is inside the project |
 
@@ -104,12 +107,13 @@ Plan rules, checked by `init`:
 - Top level: `plan.name` must be a non-empty string. `plan.goal` is an
   optional string. `tasks` must be a non-empty list.
 - Allowed task keys: `id`, `title`, `role`, `description`, `acceptance`,
-  `depends_on`, `requires_approval`, `writes`. Any other key is rejected.
+  `depends_on`, `requires_approval`, `writes`, `checkpoint`. Any other key is
+  rejected.
 - `id` and `role` must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`. Ids must be
   unique. `title` must not be empty.
 - `depends_on` is a list of unique, existing task ids. Cycles are rejected.
-- `requires_approval` is `true` or `false` (default `false`). `description` and
-  `acceptance` are strings (default empty).
+- `requires_approval` and `checkpoint` are `true` or `false` (default `false`).
+  `description` and `acceptance` are strings (default empty).
 - `writes`, when given, is a list of paths or globs relative to the working
   directory. An absolute path, a drive or `..` is rejected.
 
@@ -203,15 +207,16 @@ Errors print one line, `error: ...`, to stderr and no JSON.
 | `reject --task ID --reviewer NAME --reason TEXT` | `awaiting_review` → `failed`. Stops scheduling |
 | `retry --task ID` | `failed` → `pending` |
 | `run --config FILE --cli NAME` | Dispatch one ready task to the named CLI |
+| `advance --config FILE --max-steps N` | In `checkpoint` or `auto` mode, repeat dispatch and agent review until a stop. `N` limits the CLI starts, worker and reviewer together |
 
 Exit codes:
 
 | Code | Meaning |
 |---|---|
-| `0` | Success. This includes `"result": "idle"`, `"result": "busy"` and `run` ending in `awaiting_review` |
+| `0` | Success. This includes `"result": "idle"`, `"result": "busy"`, `run` ending in `awaiting_review`, and `advance` stopping at a checkpoint, a task for a person, `--max-steps` or the end of the plan |
 | `1` | Invalid input or state: bad plan or config, database exists, is missing or was created by an older `wbs.py`, task not ready or not awaiting review, attempt unknown or already finished, `complete` on a CLI attempt |
 | `2` | Usage error from argument parsing |
-| `3` | `"result": "blocked"` from `claim` or `run` because a task is `failed`, from `run` because a CLI attempt is open (without limits) or no longer running (with limits), or `run` whose CLI call ended `failed` |
+| `3` | `"result": "blocked"` from `claim` or `run` because a task is `failed`, from `run` because a CLI attempt is open (without limits) or no longer running (with limits), `run` whose CLI call ended `failed`, or `advance` stopping on anything unusual |
 
 Examples with the bundled examples. Replace `<skill>` with this skill's
 directory. Run `run` from the project directory.
@@ -339,6 +344,12 @@ Keep them free of secrets and personal data.
 - A schedule, a repeated `run`, or an agent the user did not assign as
   reviewer must never run `accept` or `reject`. `retry` and approval steps
   stay with the user.
+- The one exception is `advance`, and only when the user chose `checkpoint` or
+  `auto` and the agent reviewers in the config. It records the verdict of the
+  reviewer it started, under a name ending in `-auto`. It never reviews a
+  checkpoint task, never handles a `requires_approval` task and never runs
+  `retry`. With no mode set (`manual`), `advance` is refused and everything
+  above applies without exception.
 
 ## Fresh CLI sessions
 
@@ -359,7 +370,10 @@ reason. After `reject` and `retry`, the CLI gets the same prompt as before.
   read-only), so prefer files and tests, and let a person commit.
 - Keep `report_dir` out of version control, for example with `.gitignore`.
 - Report files are named per attempt, so a retried task writes a new one. The
-  earlier reports stay in `report_dir` for the reviewer.
+  earlier reports stay in `report_dir` for the reviewer. A new database restarts
+  the attempt numbers, and a file left from an earlier plan with the same name is
+  deleted when its number comes up, so give each plan its own `report_dir` to
+  keep those files.
 
 ## Scheduling
 
@@ -429,7 +443,8 @@ of the CLI limits has no effect, because the CLI limits are reached first.
 
 An orchestrator, such as a scheduler or a UI, may call `run` at the same time
 for different CLI names, or for one CLI name up to its limit. It must not run
-`accept`, `reject` or `retry`. Everything else stays as it is: exit code 0 only
+`accept`, `reject` or `retry`; `advance` does this within the same limits under
+its own rules (see "Progress modes"). Everything else stays as it is: exit code 0 only
 means `awaiting_review`, `requires_approval` tasks are never dispatched, and
 policy A and the argument checks apply to every start. The transaction in `run`
 keeps two runs from taking the same task.
@@ -441,7 +456,9 @@ keeps two runs from taking the same task.
 2. An open CLI attempt whose `wbs.py run` no longer exists: `blocked`, code 3. A
    person closes it with `fail`, as in "Scheduling". `wbs.py` compares the
    process id and start time recorded for the attempt, and treats anything it
-   cannot read as not running.
+   cannot read as not running. On systems other than Windows this reads `ps`, so
+   without a `ps` that supports `-o lstart=`, a second parallel run is always
+   `blocked`. Runs without limits do not need `ps`.
 3. A limit reached: `busy`, code 0, and the `reason` names the limit and the open
    attempts.
 4. No ready task for this CLI: `idle`, code 0.
@@ -501,6 +518,84 @@ faster. `parallel_profiles` lets each extra attempt use a lighter setting:
   arguments, like everything else in the config.
 - Profiles also work without `max_parallel`: every attempt then uses profile `"1"`.
   Attempts of other CLIs do not count, so set this per CLI.
+
+## Progress modes
+
+By default a person or an assigned agent reviews every CLI task. To let agents
+review most of them and keep people for the places that matter, the user chooses
+a mode in the config:
+
+| `progress.mode` | What happens | Where a person reviews |
+|---|---|---|
+| `manual` (default) | `run` dispatches one task. `advance` is refused | Every CLI task, unless the user assigned an agent reviewer |
+| `checkpoint` | `advance` repeats dispatch and agent review, and stops at checkpoints | Checkpoint tasks and `requires_approval` tasks |
+| `auto` | `advance` repeats dispatch and agent review | `requires_approval` tasks, and whenever `advance` stops on something unusual |
+
+```json
+{
+  "report_dir": ".wbs-reports",
+  "progress": {
+    "mode": "checkpoint",
+    "reviewers": {"builder": "checker", "checker": "builder"},
+    "checkpoints": {"tasks": ["T5"], "roles": ["implementer"], "every": 5},
+    "ignore_dirs": ["__pycache__"]
+  }
+}
+```
+
+| Key | Rule |
+|---|---|
+| `reviewers` | Every CLI that a role maps to needs a reviewer, and it must be a different CLI. The reviewer's entry in `clis` passes the same checks as a worker's |
+| `checkpoints.tasks`, `checkpoints.roles` | A person reviews these tasks. A name that is not in the plan is a config error, so a typo cannot hand a person's review to an agent |
+| `checkpoints.every` | `advance` stops after this many agent acceptances. Running it again means the person has checked, and the count starts over |
+| Plan key `checkpoint: true` | A person reviews this task. Applies in `checkpoint` mode only; `auto` ignores it |
+| `ignore_dirs` | Folder names left out of the check for reviewer changes, such as caches that a reviewer's test run creates |
+
+`report_dir` is required. `checkpoints` in `auto` is a config error, and
+`checkpoint` with no checkpoint in the config or the plan is too. `--max-steps`
+is required, so the user sets how many CLI starts one call may spend.
+
+How `advance` works:
+
+- It claims tasks like `run`, within the limits of "Running CLIs in parallel",
+  and starts each free CLI at once. It waits until no CLI attempt is open before
+  it reviews, so only the reviewer can change files during a review. Reviews run
+  one at a time and therefore use profile `"1"`.
+- Each review is a new process in the working directory, with a new prompt. The
+  reviewer writes `<report_dir>/<task>-attempt<N>-review<K>.md`, whose first line
+  must be `VERDICT: accept`, `VERDICT: reject` or `VERDICT: needs-human`. Only that
+  first line is read, and the reasons stay in the file. A file left from an
+  earlier plan with the same name is deleted first.
+- `advance` compares the size and modification time of every project file before
+  and after the review, leaving out `.git`, `report_dir`, `warning_dir`, the
+  database and `ignore_dirs`. A manual `claim` is not visible to this check, so do
+  not edit the project by hand while `advance` runs.
+- Running CLIs are never stopped. After a stop, `advance` waits for them and
+  records their results.
+- It prints `stop`, `reason`, `abnormal`, `steps`, `auto_accepted` (task and
+  reviewer) and `started`. The events keep the stop, the number of acceptances,
+  each reviewer name, its arguments and its verdict.
+
+| `stop` | Meaning | Exit code | Next step |
+|---|---|---|---|
+| `checkpoint` | A checkpoint task is `awaiting_review` | `0` | A person runs `accept` or `reject`, then `advance` |
+| `every` | `checkpoints.every` acceptances reached | `0` | A person checks progress, then `advance` |
+| `person_needed` | Only tasks for a person are ready | `0` | A person handles them, then `advance` |
+| `max_steps` | `--max-steps` reached | `0` | `advance` again if progress and cost look right |
+| `other_run` | Another `run` has an open attempt | `0` | `advance` again when it has ended |
+| `done`, `idle` | All tasks done, or nothing can start | `0` | Nothing, or check `status` |
+| `blocked` | A task is `failed`, or an attempt was interrupted | `3` | As in "Recover" |
+| `failed` | A CLI failed, or reported `needs-approval` or `blocked` | `3` | Inspect, fix, `retry` |
+| `rejected` | The reviewer rejected the task | `3` | Read the verdict file, fix, `retry` |
+| `review_failed` | The reviewer failed or timed out. Its result is not used | `3` | Fix the cause, then `advance`, or review by hand |
+| `review_undecided` | The verdict is `needs-human`, missing or malformed | `3` | A person reviews with `accept` or `reject` |
+| `review_changed_files` | The reviewer changed project files. Its verdict is not used | `3` | A person inspects the change and reviews |
+| `call_warning` | A task reached a multiple of 5 CLI starts | `3` | Check progress, cost and quota, then review the task |
+
+An agent reviewer can be wrong, and its acceptance releases the next tasks with
+no person looking. Choose `auto` only for work you can afford to redo, try it on
+a fictional plan first, and keep merging and publishing as `requires_approval`
+tasks.
 
 ## HTML status report
 
@@ -605,6 +700,11 @@ They cover:
 - `parallel_profiles`: the arguments a stand-in CLI receives at each
   parallelism, the fallback to a lower profile or `argv` alone, invalid or
   bypassing profiles, and the record shown by `status`.
+- `advance`: refused without a mode, repeating up to an approval task, each kind
+  of checkpoint and resuming after it, parallel starts, unusable reviews (changed
+  files, missing, malformed, `needs-human`, a failed reviewer, a verdict left by
+  an earlier plan), rejection, CLI failure, the call warning, `--max-steps`, an
+  interrupted attempt, invalid `progress` settings, and the names in the events.
 - The review gate: exit code 0 needs `accept`, `complete` is refused, and
   `reject` blocks until `retry`.
 - `render_wbs.py`: escaped titles and plan name, every task row in plan
